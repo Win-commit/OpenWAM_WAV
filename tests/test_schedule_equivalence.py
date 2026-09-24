@@ -47,6 +47,37 @@ def test_make_schedule_sync():
     assert result[-1] == (0.0, 0.0)
 
 
+def test_make_schedule_sync_three_streams_uses_independent_value_shift():
+    from openwam.deploy.denoise_schedule import make_schedule
+    from openwam.model.value_backbone.scheduler import ValueScheduler
+
+    v, a = _two_schedulers()
+    q = ValueScheduler()
+    assert q is not a
+    assert q.DEFAULT_SHIFT == 5.0
+    result = make_schedule(
+        "sync",
+        v,
+        a,
+        num_steps=20,
+        shift=5.0,
+        value_scheduler=q,
+        shift_value=3.0,
+    )
+    assert result[-1] == (0.0, 0.0, 0.0)
+    assert all(len(step) == 3 for step in result)
+    # q owns its own grid: a distinct shift makes it differ from action.
+    assert result[1][1] != result[1][2]
+
+
+def test_make_schedule_rejects_async_three_stream_deployment():
+    from openwam.deploy.denoise_schedule import make_schedule
+
+    v, a = _two_stub_schedulers()
+    with pytest.raises(NotImplementedError, match="sync"):
+        make_schedule("async", v, a, value_scheduler=_StubScheduler())
+
+
 def test_make_schedule_rejects_invalid_mode():
     from openwam.deploy.denoise_schedule import make_schedule
 

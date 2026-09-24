@@ -14,6 +14,7 @@ _NORMALIZATION_SEMANTIC_KEYS = (
     "osc_position_scale",
     "osc_rotation_scale",
 )
+VALUE_NORMALIZATION_STATS_FILENAME = "value_normalization_stats.json"
 
 
 # --- Deploy assets (write-once) ---
@@ -68,6 +69,52 @@ def save_normalization_stats(output_dir: str, dataset) -> None:
     os.makedirs(output_dir, exist_ok=True)
     shutil.copyfile(src, dst)
     logger.info("[normalizer] Copied action stats into checkpoint dir:\n  src: %s\n  dst: %s", src, dst)
+
+
+def save_value_normalization_stats(output_dir: str, dataset) -> None:
+    """Copy the reader's global value Z-score artifact into a checkpoint.
+
+    Unlike action stats this is always JSON and is meaningful only for a WAV
+    reader with ``include_value_targets=true``.  Keeping it separate avoids
+    changing the established action ``normalization_stats.npy`` schema.
+    """
+    import shutil
+
+    dst = os.path.join(output_dir, VALUE_NORMALIZATION_STATS_FILENAME)
+    if os.path.exists(dst):
+        logger.info("[value-normalizer] %s already present; skip copy", dst)
+        return
+    src = getattr(dataset, "value_normalization_stats_path", None)
+    if not src:
+        return
+    if not os.path.isfile(src):
+        raise FileNotFoundError(
+            f"dataset reports value_normalization_stats_path={src} but the file does not exist"
+        )
+    os.makedirs(output_dir, exist_ok=True)
+    shutil.copyfile(src, dst)
+    logger.info("[value-normalizer] Copied value stats into checkpoint dir:\n  src: %s\n  dst: %s", src, dst)
+
+
+def verify_resume_value_normalization_stats(output_dir: str, dataset) -> None:
+    """Reject resume when the value Z-score coordinates changed."""
+    src = getattr(dataset, "value_normalization_stats_path", None)
+    if not src:
+        return
+    dst = os.path.join(output_dir, VALUE_NORMALIZATION_STATS_FILENAME)
+    if not os.path.isfile(dst):
+        raise FileNotFoundError(
+            f"resume blocked: {dst} is missing while dataset value stats are {src}. "
+            "Use finetune_ckpt_path to start a new value-normalization run."
+        )
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"resume blocked: dataset value stats file is missing: {src}")
+    with open(src, "rb") as source, open(dst, "rb") as checkpoint:
+        if source.read() != checkpoint.read():
+            raise ValueError(
+                "resume blocked: checkpoint value_normalization_stats.json differs from the dataset artifact. "
+                "Restored value weights/optimizer state use different target coordinates; use finetune_ckpt_path."
+            )
 
 
 def _normalization_stats_values_equal(left, right) -> bool:

@@ -122,8 +122,67 @@ def _assert_decode_video_supported(vb) -> None:
         )
 
 
+def _repeat_inference_batch_for_candidates(inputs: dict[str, Any], num_candidates: int) -> dict[str, Any]:
+    """Repeat singleton-batch inference inputs for joint candidate sampling.
+
+    Backbone preprocessing produces a batch of one.  A value-guided MPC call
+    samples several complete trajectories at once, so every batched tensor
+    (text context, conditioning latents, masks, and architecture-specific
+    conditioning) must have the same batch dimension as the three noisy
+    streams.  Values that are not tensors, scalars, and already non-singleton
+    tensors are left intact.  The latter deliberately fail later at the
+    backbone boundary instead of silently reinterpreting a user-provided
+    batch as candidates.
+    """
+    if num_candidates == 1:
+        return inputs
+    repeated: dict[str, Any] = {}
+    for key, value in inputs.items():
+        if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == 1:
+            repeated[key] = value.repeat((num_candidates,) + (1,) * (value.ndim - 1))
+        else:
+            repeated[key] = value
+    return repeated
+
+
+def _candidate_video_noise(latents: Tensor, num_candidates: int, seed: int) -> Tensor:
+    """Make independently seeded video-noise starts while preserving candidate 0.
+
+    The first sample is exactly the preprocessing output, preserving the
+    legacy one-candidate trajectory.  Additional candidates use a separate
+    seed stream so action/value candidate count does not perturb the original
+    video sample's RNG sequence.
+    """
+    if num_candidates == 1:
+        return latents
+    if latents.ndim == 0 or latents.shape[0] != num_candidates:
+        raise ValueError(
+            "candidate video latents must have batch size equal to value_num_candidates; "
+            f"got shape {tuple(latents.shape)} for {num_candidates} candidates"
+        )
+    # torch.Generator requires a non-negative 64-bit seed.  Keep a dedicated
+    # stream away from the action/value seeds to make candidate sampling
+    # reproducible without coupling the modalities' noise draws.
+    candidate_seed = (int(seed) + 1_000_003) % (2**63 - 1)
+    generator = torch.Generator(device=latents.device).manual_seed(candidate_seed)
+    sampled = torch.randn(
+        latents.shape,
+        dtype=latents.dtype,
+        device=latents.device,
+        generator=generator,
+    )
+    sampled[0:1] = latents[0:1]
+    return sampled
+
+
+def _symexp(values: Tensor) -> Tensor:
+    """Numerically transparent inverse of the value stream's symlog map."""
+    return torch.sign(values) * torch.expm1(values.abs())
+
+
 if TYPE_CHECKING:
     from openwam.model.action_backbone.base import ActionDiTBackbone, SharedActionBackbone
+    from openwam.model.value_backbone.value_dit import ValueBackbone
     from openwam.model.video_backbone.base import VideoBackbone
 
     AnyActionBackbone = Union["ActionDiTBackbone", "SharedActionBackbone"]
@@ -169,6 +228,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self.cfg = cfg
         self.video_backbone: Optional["VideoBackbone"] = None
         self.action_backbone: Optional["AnyActionBackbone"] = None
+        # Only the three-stream dual-system architecture instantiates this.
+        # Keeping ownership here makes checkpoint/device/freeze plumbing
+        # generic rather than a special deployment path.
+        self.value_backbone: Optional["ValueBackbone"] = None
         self._device = torch.device("cuda")
         self._dtype = torch.bfloat16
 
@@ -184,8 +247,22 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # return real-scale actions; deploy-side proprio preprocessing uses it
         # to normalize raw robot state into the model's training space.
         self.normalizer = None
+        # Optional global Z-score inverse for the value stream.  Values are
+        # modeled in symlog(Z-score(return)) space, then converted back to raw
+        # discounted-return units only for candidate ranking/reporting.
+        self.value_normalizer = None
 
         if cfg is not None:
+            value_cfg = self._cfg_get(cfg, "value_backbone", None)
+            value_enabled = bool(self._cfg_get(value_cfg, "enabled", False))
+            if value_enabled and (
+                self._cfg_get(cfg, "framework", None) != "dual_system"
+                or self._cfg_get(cfg, "variant", None) != "joint_self_attn"
+            ):
+                raise ValueError(
+                    "value_backbone.enabled=true is supported only by "
+                    "dual_system variant='joint_self_attn'"
+                )
             self._init_video_backbone(cfg)
 
     @staticmethod
@@ -461,6 +538,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
             result["video_backbone"] = self.video_backbone
         if self.action_backbone is not None:
             result["action_backbone"] = self.action_backbone
+        if self.value_backbone is not None:
+            result["value_backbone"] = self.value_backbone
         return result
 
     # --- Action-side properties (delegate to action_backbone) ---
@@ -471,6 +550,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if self.action_backbone is None:
             raise RuntimeError("action_backbone is not initialized")
         return self.action_backbone.scheduler
+
+    @property
+    def value_scheduler(self):
+        """Flow-matching scheduler for the optional value stream."""
+        if self.value_backbone is None:
+            raise RuntimeError("value_backbone is not initialized")
+        return self.value_backbone.scheduler
 
     @property
     def video_scheduler(self):
@@ -643,6 +729,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """
         self.normalizer = normalizer
 
+    def attach_value_normalizer(self, normalizer) -> None:
+        """Attach the global value Z-score normalizer used at deployment."""
+        self.value_normalizer = normalizer
+
     def normalize_deploy_proprio(self, proprio):
         """Normalize raw deploy proprio (array-like) into a float32 tensor; ``None`` passes through.
 
@@ -676,13 +766,22 @@ class BaseWAMArchitecture(ABC, nn.Module):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         save_file(state_dict, path)
 
-    def load_checkpoint(self, path: str, strict: bool = True) -> None:
+    def load_checkpoint(
+        self,
+        path: str,
+        strict: bool = True,
+        *,
+        allowed_missing_prefixes: tuple[str, ...] = (),
+    ) -> None:
         """Load architecture state from a safetensors checkpoint.
 
         VLM backbone weights are not stored in the safetensors file (they
         are saved as a separate directory). When a VLM backbone is present,
         missing ``vlm_backbone.*`` keys are tolerated; unexpected or missing
-        non-VLM keys still raise under ``strict=True``.
+        non-VLM keys still raise under ``strict=True``. A narrowly scoped
+        warm-start migration may additionally pass ``allowed_missing_prefixes``;
+        only missing keys under those prefixes are ignored, while every other
+        missing or unexpected key remains strict.
 
         Meta-device sub-modules (self-contained deploy empty shells built
         via ``from_empty`` / ``init_empty_weights``) need
@@ -699,15 +798,20 @@ class BaseWAMArchitecture(ABC, nn.Module):
         has_vlm = getattr(self, "vlm_backbone", None) is not None
         has_meta = any(p.device.type == "meta" for p in self.parameters())
         missing, unexpected = self.load_state_dict(state_dict, strict=False, assign=has_meta)
-        if strict and not has_vlm:
-            if missing or unexpected:
-                raise RuntimeError(f"Strict load failed: missing={missing}, unexpected={unexpected}")
-        elif strict and has_vlm:
-            non_vlm_missing = [k for k in missing if not k.startswith(VLM_STATE_DICT_PREFIX)]
-            if non_vlm_missing or unexpected:
-                raise RuntimeError(
-                    f"Strict load failed (VLM keys excluded): missing={non_vlm_missing}, unexpected={unexpected}"
-                )
+        tolerated_prefixes = tuple(allowed_missing_prefixes)
+        if has_vlm:
+            tolerated_prefixes += (VLM_STATE_DICT_PREFIX,)
+        strict_missing = [k for k in missing if not k.startswith(tolerated_prefixes)]
+        tolerated_missing = [k for k in missing if k not in strict_missing]
+        if tolerated_missing:
+            logging.getLogger(__name__).warning(
+                "Checkpoint %s does not contain %d newly initialized parameter(s) under allowed prefixes %s",
+                path,
+                len(tolerated_missing),
+                tolerated_prefixes,
+            )
+        if strict and (strict_missing or unexpected):
+            raise RuntimeError(f"Strict load failed: missing={strict_missing}, unexpected={unexpected}")
 
     # --- Training: module management ---
 
@@ -715,7 +819,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
         """Initialize all backbone schedulers for training.
 
         Single source of truth for each stream's α-shift:
-        ``video_backbone.shift_video`` and ``action_backbone.shift_action``.
+        ``video_backbone.shift_video``, ``action_backbone.shift_action`` and
+        (when enabled) ``value_backbone.shift_value``.
         The same properties are read by the deploy schedule at inference time,
         so the discrete training sigma buffer and the inference denoising
         trajectory are sampled from the same shifted schedule — train/inference
@@ -734,7 +839,12 @@ class BaseWAMArchitecture(ABC, nn.Module):
             if not hasattr(bb, "scheduler"):
                 continue
             kwargs = {"training": True}
-            shift = getattr(bb, "shift_video" if name == "video_backbone" else "shift_action", None)
+            if name == "video_backbone":
+                shift = getattr(bb, "shift_video", None)
+            elif name == "value_backbone":
+                shift = getattr(bb, "shift_value", None)
+            else:
+                shift = getattr(bb, "shift_action", None)
             if shift is not None:
                 kwargs["shift"] = float(shift)
             bb.scheduler.set_timesteps(num_timesteps, **kwargs)
@@ -897,9 +1007,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
         all_vace_videos: list = []
         all_ref_images: list = []
         all_actions: list = []
+        all_values: list = []
         all_proprios: list = []
         all_proprio_masks: list = []
         all_action_masks: list = []
+        all_value_masks: list = []
         all_video_masks: list = []
 
         for sample in samples:
@@ -914,6 +1026,20 @@ class BaseWAMArchitecture(ABC, nn.Module):
                     action = torch.from_numpy(action)
                 action = action.to(dtype=_dtype, device=_device).unsqueeze(0)
             all_actions.append(action)
+
+            value = sample.get("value")
+            if value is None:
+                # ``value_targets`` is accepted for compatibility with WAV
+                # readers outside this package; canonical OpenWAM samples use
+                # the shorter ``value`` key.
+                value = sample.get("value_targets")
+            if value is not None:
+                if isinstance(value, np.ndarray):
+                    value = torch.from_numpy(value)
+                if value.ndim != 2:
+                    raise ValueError(f"sample value must be [T, D], got shape {tuple(value.shape)}")
+                value = value.to(dtype=_dtype, device=_device).unsqueeze(0)
+            all_values.append(value)
 
             # Carry proprio whenever the sample provides it — the main-stream
             # proprio-context path consumes it downstream, so the bridge into
@@ -951,12 +1077,16 @@ class BaseWAMArchitecture(ABC, nn.Module):
             all_proprio_masks.append(pmask)
 
             amask = sample.get("action_mask", None)
+            qmask = sample.get("value_mask", None)
             vmask = sample.get("video_mask", None)
             if isinstance(amask, np.ndarray):
                 amask = torch.from_numpy(amask)
+            if isinstance(qmask, np.ndarray):
+                qmask = torch.from_numpy(qmask)
             if isinstance(vmask, np.ndarray):
                 vmask = torch.from_numpy(vmask)
             all_action_masks.append(amask)
+            all_value_masks.append(qmask)
             all_video_masks.append(vmask)
 
         ref_flags = [r is not None for r in all_ref_images]
@@ -971,6 +1101,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         )
 
         action_data = torch.cat(all_actions, dim=0) if all_actions[0] is not None else None
+        value_data = torch.cat(all_values, dim=0) if all_values[0] is not None else None
 
         inputs = {
             **preprocessed,
@@ -983,6 +1114,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
             "max_timestep_boundary": self._max_timestep_boundary,
             "min_timestep_boundary": self._min_timestep_boundary,
             "actions": action_data,
+            "values": value_data,
         }
 
         # Bridge proprio into inputs whenever the batch carries it (not gated on
@@ -1004,6 +1136,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         if all_action_masks[0] is not None:
             inputs["action_is_pad"] = torch.stack([~m for m in all_action_masks], dim=0).to(device=_device)
+        if all_value_masks[0] is not None:
+            inputs["value_is_pad"] = torch.stack([~m for m in all_value_masks], dim=0).to(device=_device)
         if all_video_masks[0] is not None:
             # ``latent[0]`` is a clean conditioning frame (and must be excluded
             # from the loss mask) when either:
@@ -1045,11 +1179,13 @@ class BaseWAMArchitecture(ABC, nn.Module):
         self,
         *,
         actions: Optional[torch.Tensor] = None,
+        values: Optional[torch.Tensor] = None,
         lambda_video: float = 1.0,
         lambda_action: float = 1.0,
+        lambda_value: float = 0.0,
         **inputs,
     ) -> dict:
-        """Compute joint video-action flow matching loss.
+        """Compute joint video-value-action flow matching loss.
 
         This is the single entry point for training loss computation.
         Handles timestep sampling, noise injection, forward pass, and
@@ -1066,10 +1202,11 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 be passed via ``inputs["actions"]``.
             lambda_video: Weight for video loss term.
             lambda_action: Weight for action loss term.
+            lambda_value: Weight for value loss term.
             **inputs: Preprocessed video/text tensors plus forward-time flags.
 
         Returns:
-            dict with keys: loss, loss_video, loss_action.
+            dict with keys: loss, loss_video, loss_action, loss_value.
         """
         vb = self.video_backbone
         action_scheduler = self.action_backbone.scheduler
@@ -1080,6 +1217,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
             actions = inputs.pop("actions", None)
         else:
             inputs.pop("actions", None)
+        if values is None:
+            values = inputs.pop("values", None)
+        else:
+            inputs.pop("values", None)
+        if lambda_value > 0:
+            if values is None:
+                raise ValueError("lambda_value > 0 but no value targets were provided.")
+            if self.value_backbone is None:
+                raise ValueError("lambda_value > 0 requires an architecture with value_backbone enabled.")
+            if not hasattr(self, "forward_joint"):
+                raise NotImplementedError("This architecture does not implement value-enabled joint forward.")
 
         max_tb = int(inputs.pop("max_timestep_boundary", 1) * len(vb.scheduler.timesteps))
         min_tb = int(inputs.pop("min_timestep_boundary", 0) * len(vb.scheduler.timesteps))
@@ -1127,6 +1275,37 @@ class BaseWAMArchitecture(ABC, nn.Module):
             noisy_actions = action_scheduler.add_noise(actions, action_noise, a_sigma_bc)
             action_target = action_scheduler.training_target(actions, action_noise)
 
+        # --- Prepare independent value noise ---
+        noisy_values = value_target = value_timesteps = value_timestep_ids = None
+        value_scheduler = None
+        if lambda_value > 0:
+            value_scheduler = self.value_backbone.scheduler
+            values = values.to(dtype=_dtype, device=_device)
+            if values.dim() == 2:
+                values = values.unsqueeze(0)
+            if values.dim() != 3:
+                raise ValueError(f"values must have shape [B, T, D], got {tuple(values.shape)}")
+            if values.shape[0] != B:
+                raise ValueError(
+                    f"values batch size ({values.shape[0]}) must match video batch size ({B})"
+                )
+            expected_value_dim = int(self.value_backbone.value_dim)
+            if values.shape[-1] != expected_value_dim:
+                raise ValueError(
+                    f"values last dim ({values.shape[-1]}) must match value_backbone.value_dim={expected_value_dim}"
+                )
+            # WAV trains the flow model in symlog space after the dataset's
+            # global Z-score normalization.  This keeps long-horizon sparse
+            # returns numerically tame without coupling value noise to action.
+            value_clean = torch.sign(values) * torch.log1p(values.abs())
+            value_timestep_ids = torch.randint(0, len(value_scheduler.timesteps), (B,))
+            value_timesteps = value_scheduler.timesteps[value_timestep_ids].to(dtype=_dtype, device=_device)
+            value_sigmas = value_scheduler.sigmas[value_timestep_ids].to(dtype=_dtype, device=_device)
+            value_noise = torch.randn_like(value_clean)
+            q_sigma_bc = value_sigmas.view(B, 1, 1)
+            noisy_values = value_scheduler.add_noise(value_clean, value_noise, q_sigma_bc)
+            value_target = value_scheduler.training_target(value_clean, value_noise)
+
         # --- Joint forward pass ---
         forward_inputs = dict(inputs)
         proprio = forward_inputs.pop("proprio", None)
@@ -1137,6 +1316,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         # from `forward_inputs` so they don't leak into vb.prepare(). Per FastWAM
         # MoT design, attention itself does not consume sample-level padding.
         forward_inputs.pop("action_is_pad", None)
+        forward_inputs.pop("value_is_pad", None)
         forward_inputs.pop("video_is_pad", None)
 
         # Route per-sample proprio_mask through pipeline_inputs to
@@ -1146,15 +1326,35 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         # Use ``self(...)`` (not ``self.forward(...)``) so ``nn.Module.__call__``
         # is invoked and any architecture-level forward-pre-hooks fire.
-        video_noise_pred, action_noise_pred = self(
-            noisy_actions if lambda_action > 0 else None,
-            action_timesteps if lambda_action > 0 else None,
-            proprio=proprio,
-            use_gradient_checkpointing=use_grad_ckpt,
-            use_gradient_checkpointing_offload=use_grad_ckpt_offload,
-            **forward_inputs,
-            timestep=video_timesteps,
-        )
+        if lambda_value > 0:
+            joint_output = self(
+                noisy_actions if lambda_action > 0 else None,
+                action_timesteps if lambda_action > 0 else None,
+                noisy_values=noisy_values,
+                value_timestep=value_timesteps,
+                proprio=proprio,
+                use_gradient_checkpointing=use_grad_ckpt,
+                use_gradient_checkpointing_offload=use_grad_ckpt_offload,
+                **forward_inputs,
+                timestep=video_timesteps,
+            )
+            if not isinstance(joint_output, tuple) or len(joint_output) != 3:
+                raise RuntimeError(
+                    "value-enabled forward must return "
+                    "(video_velocity, action_velocity, value_velocity)"
+                )
+            video_noise_pred, action_noise_pred, value_noise_pred = joint_output
+        else:
+            video_noise_pred, action_noise_pred = self(
+                noisy_actions if lambda_action > 0 else None,
+                action_timesteps if lambda_action > 0 else None,
+                proprio=proprio,
+                use_gradient_checkpointing=use_grad_ckpt,
+                use_gradient_checkpointing_offload=use_grad_ckpt_offload,
+                **forward_inputs,
+                timestep=video_timesteps,
+            )
+            value_noise_pred = None
 
         # --- Video loss ---
         loss_video = self._compute_video_loss(
@@ -1165,35 +1365,80 @@ class BaseWAMArchitecture(ABC, nn.Module):
             _device,
         )
 
-        if lambda_action == 0 or action_noise_pred is None:
-            return {
-                "loss": lambda_video * loss_video,
-                "loss_video": lambda_video * loss_video.detach(),
-                "loss_action": torch.tensor(0.0, device=loss_video.device),
-            }
+        if lambda_value > 0:
+            if value_noise_pred is None:
+                raise RuntimeError("value-enabled forward returned no value prediction")
+            loss_value = self._compute_value_loss(
+                value_noise_pred,
+                value_target,
+                value_timestep_ids,
+                value_scheduler,
+                inputs,
+                _device,
+            )
+        else:
+            loss_value = torch.tensor(0.0, device=loss_video.device)
 
         # --- Action loss ---
-        loss_action = self._compute_action_loss(
-            action_noise_pred,
-            action_target,
-            action_timestep_ids,
-            action_scheduler,
-            inputs,
-            _device,
-        )
-
-        if lambda_video == 0:
-            loss = lambda_action * loss_action
+        if lambda_action == 0 or action_noise_pred is None:
+            loss_action = torch.tensor(0.0, device=loss_video.device)
         else:
-            loss = lambda_video * loss_video + lambda_action * loss_action
+            loss_action = self._compute_action_loss(
+                action_noise_pred,
+                action_target,
+                action_timestep_ids,
+                action_scheduler,
+                inputs,
+                _device,
+            )
+
+        loss = lambda_video * loss_video + lambda_action * loss_action + lambda_value * loss_value
 
         result = {
             "loss": loss,
             "loss_video": lambda_video * loss_video.detach(),
             "loss_action": lambda_action * loss_action.detach(),
+            "loss_value": lambda_value * loss_value.detach(),
         }
 
         return result
+
+    @staticmethod
+    def _compute_value_loss(noise_pred, target, timestep_ids, scheduler, inputs, device):
+        """Time-weighted masked MSE for value velocity.
+
+        Value owns an :class:`ValueScheduler`, so its BSMNTW timestep weight
+        is intentionally looked up from that scheduler rather than borrowed
+        from action/video.  ``value_is_pad`` accepts either per-time or
+        per-time×dimension masks, matching the action mask contract.
+        """
+        import torch.nn.functional as F
+
+        per_cell = F.mse_loss(noise_pred.float(), target.float(), reduction="none")
+        tw = scheduler.training_weight(timestep_ids).to(dtype=torch.float32, device=device)
+        if tw.ndim != 1 or tw.shape[0] != per_cell.shape[0]:
+            raise ValueError(
+                f"value loss weights must have shape [B]={per_cell.shape[0]}, got {tuple(tw.shape)}"
+            )
+        value_is_pad = inputs.get("value_is_pad")
+        if value_is_pad is None:
+            return (per_cell.mean(dim=(1, 2)) * tw).mean()
+        pad = value_is_pad.to(device=device, dtype=torch.bool)
+        if pad.ndim == 2:
+            pad = pad.unsqueeze(-1)
+        if pad.shape[0] != per_cell.shape[0] or pad.shape[1] != per_cell.shape[1]:
+            raise ValueError(
+                f"value_is_pad shape {tuple(pad.shape)} is incompatible with value loss {tuple(per_cell.shape)}"
+            )
+        if pad.shape[-1] not in (1, per_cell.shape[-1]):
+            raise ValueError(
+                f"value_is_pad last dim {pad.shape[-1]} must be 1 or value dim {per_cell.shape[-1]}"
+            )
+        valid = (~pad).to(per_cell.dtype)
+        if valid.shape[-1] == 1 and per_cell.shape[-1] != 1:
+            valid = valid.expand_as(per_cell)
+        per_sample = (per_cell * valid).sum(dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp_min(1.0)
+        return (per_sample * tw).mean()
 
     def _compute_video_loss(self, noise_pred, target, timestep_ids, inputs, device):
         """Per-sample weighted video MSE loss."""
@@ -1367,11 +1612,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
         first_frame_image=None,
         num_frames: int = 49,
         action_num_frames: Optional[int] = None,
+        value_num_frames: Optional[int] = None,
+        value_num_candidates: int = 1,
+        value_selection: str = "first",
+        exploration: Optional[dict] = None,
         height: int = 384,
         width: int = 320,
         seed: int = 42,
         tiled: bool = True,
         input_video_latents: Optional[Tensor] = None,
+        input_value_latents: Optional[Tensor] = None,
+        _preprocessed_inputs: Optional[dict] = None,
         num_inference_steps: int = 50,
         shift: float = 5.0,
         tile_size: tuple = None,
@@ -1387,7 +1638,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         active_action_mask: Optional[Tensor] = None,
         **extra_pipeline_inputs: Any,
     ) -> dict:
-        """Execute joint video-action denoising driven by a schedule.
+        """Execute joint video-action (optionally value) denoising.
 
         This is the single entry point for inference. External code
         (engine) should call this instead of touching video_backbone directly.
@@ -1399,6 +1650,17 @@ class BaseWAMArchitecture(ABC, nn.Module):
             action_num_frames: Raw state/action window length. Generated
                 action chunk length is ``action_num_frames - 1``. Defaults to
                 ``num_frames`` for datasets whose video/action rates match.
+            value_num_frames: Value-token horizon. Defaults to the action
+                chunk length, so values represent the same next states as
+                action targets.
+            value_num_candidates: For a value-enabled model, jointly sample
+                this many video/value/action trajectories and select the one
+                with the highest predicted value. Must be 1 for old two-stream
+                checkpoints.
+            value_selection: Candidate scoring reduction: ``first`` (MPC
+                default), ``mean``, or ``last`` over value tokens.
+            exploration: Optional iterative elite-search configuration. Disabled
+                by default; mutually exclusive with multiple final candidates.
             active_action_mask: Optional ``(action_dim,)`` boolean mask for the
                 benchmark being generated. Inactive unified-action dimensions
                 stay on their analytic zero-padding noise path. When omitted,
@@ -1406,7 +1668,8 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         Returns:
             dict with ``video`` (list of PIL images or None) and
-            ``actions`` ((T, action_dim) numpy array).
+            ``actions`` ((T, action_dim) numpy array). Value-enabled runs also
+            return raw discounted-return ``values`` and candidate score data.
         """
         import time
 
@@ -1438,13 +1701,70 @@ class BaseWAMArchitecture(ABC, nn.Module):
             dit_cache = None
 
         action_num_frames = int(action_num_frames if action_num_frames is not None else num_frames)
+        if action_num_frames < 2:
+            raise ValueError(f"action_num_frames must be >= 2, got {action_num_frames}")
+        value_backbone = getattr(self, "value_backbone", None)
+        value_enabled = value_backbone is not None
+        from openwam.model.value_backbone.exploration import ExplorationConfig
+
+        exploration_config = ExplorationConfig.from_mapping(exploration)
+        value_num_candidates = int(value_num_candidates)
+        if value_num_candidates < 1:
+            raise ValueError(f"value_num_candidates must be >= 1, got {value_num_candidates}")
+        if not value_enabled and value_num_candidates != 1:
+            raise ValueError("value_num_candidates > 1 requires a value_backbone-enabled checkpoint")
+        if exploration_config.enabled and not value_enabled:
+            raise ValueError("exploration requires a value_backbone-enabled checkpoint")
+        if exploration_config.enabled and value_num_candidates != 1:
+            raise ValueError("exploration and value_num_candidates > 1 cannot be enabled together")
+        if value_enabled:
+            if cfg_scale_f > 1.0:
+                raise NotImplementedError("CFG is not yet supported for value-enabled three-stream deployment")
+            if dit_cache is not None:
+                # The cache stores only video/action velocities. Reusing it
+                # would pair a stale value velocity with fresh candidates.
+                dit_cache = None
+            value_num_frames = int(value_num_frames if value_num_frames is not None else action_num_frames - 1)
+            if value_num_frames < 1:
+                raise ValueError(f"value_num_frames must be >= 1, got {value_num_frames}")
+            if value_selection not in {"first", "mean", "last"}:
+                raise ValueError("value_selection must be one of: first, mean, last")
+            if getattr(self, "value_normalizer", None) is None:
+                raise RuntimeError(
+                    "value-enabled deployment requires value_normalization_stats.json; "
+                    "load a checkpoint trained with RoboDojo value sidecars"
+                )
+            if not schedule or len(schedule[0]) != 3:
+                raise ValueError(
+                    "value-enabled deployment requires a [video, value, action] triple schedule; "
+                    "build it with make_schedule(..., value_scheduler=architecture.value_scheduler)"
+                )
+        elif schedule and len(schedule[0]) != 2:
+            raise ValueError("two-stream deployment requires a [video, action] pair schedule")
+
+        if exploration_config.enabled:
+            if _preprocessed_inputs is not None or input_video_latents is not None or input_value_latents is not None:
+                raise ValueError("exploration owns the initial noise; explicit latents are unsupported")
+            return self._generate_with_exploration(
+                exploration_config,
+                schedule=schedule, prompt=prompt, vace_video=vace_video,
+                first_frame_image=first_frame_image, num_frames=num_frames,
+                action_num_frames=action_num_frames, value_num_frames=value_num_frames,
+                value_selection=value_selection, height=height, width=width, seed=seed,
+                tiled=tiled, num_inference_steps=num_inference_steps, shift=shift,
+                decode_video=decode_video, profile=profile, vace_cache=vace_cache,
+                prompt_embed_cache=prompt_embed_cache, proprio=proprio,
+                cfg_scale=cfg_scale, cfg_merge=cfg_merge,
+                active_action_mask=active_action_mask,
+                extra_pipeline_inputs=extra_pipeline_inputs,
+            )
 
         # CFG knobs ARE forwarded so a CFG-capable backbone (CosmosPredict25)
         # can materialise ``inputs_shared['uncond_context']`` from its own
         # encoder; the denoising loop below then applies CFG via
         # ``cfg_scale_f`` / ``cfg_merge``. Wan does no CFG at inference and
         # swallows these via ``**kw``, so its behaviour is unchanged.
-        inputs_shared = vb.preprocess_input_for_inference(
+        inputs_shared = dict(_preprocessed_inputs) if _preprocessed_inputs is not None else vb.preprocess_input_for_inference(
             prompt=prompt,
             vace_video=vace_video,
             first_frame_image=first_frame_image,
@@ -1483,16 +1803,57 @@ class BaseWAMArchitecture(ABC, nn.Module):
         if self.uses_proprioception:
             if proprio is None:
                 raise ValueError("use_proprioception=True requires `proprio` during generation.")
-            inputs_shared["proprio"] = proprio.to(device=device, dtype=dtype)
+            proprio_model = proprio.to(device=device, dtype=dtype)
+            # Canonicalize a raw state vector to a singleton batch *before*
+            # candidate expansion.  Without this, a one-dimensional state
+            # with D=1 would be mistaken for a batched singleton tensor.
+            if proprio_model.ndim == 1:
+                proprio_model = proprio_model.unsqueeze(0)
+            inputs_shared["proprio"] = proprio_model
+
+        # Value-guided deployment treats candidates as a batch of complete
+        # trajectories.  Only this opt-in path changes the batch shape; old
+        # video/action calls retain their exact singleton preprocessing and
+        # RNG behavior.
+        candidate_batch = value_num_candidates if value_enabled else 1
+        if value_enabled and candidate_batch > 1:
+            inputs_shared = _repeat_inference_batch_for_candidates(inputs_shared, candidate_batch)
+            if input_video_latents is None:
+                inputs_shared["latents"] = _candidate_video_noise(
+                    inputs_shared["latents"], candidate_batch, seed
+                )
+                # First-frame conditioning must remain clean for every
+                # candidate after the independent noise starts are sampled.
+                ref_latents = inputs_shared.get("first_frame_latents")
+                if ref_latents is not None:
+                    latents = inputs_shared["latents"].clone()
+                    latents[:, :, : ref_latents.shape[2]] = ref_latents
+                    inputs_shared["latents"] = latents
 
         action_latents = torch.randn(
-            1,
+            candidate_batch,
             action_num_frames - 1,
             self.action_dim,
             device=device,
             dtype=dtype,
             generator=torch.Generator(device=device).manual_seed(seed),
         )
+        value_latents = None
+        if value_enabled:
+            if input_value_latents is not None:
+                expected_shape = (candidate_batch, value_num_frames, value_backbone.value_dim)
+                if tuple(input_value_latents.shape) != expected_shape:
+                    raise ValueError(f"input_value_latents must have shape {expected_shape}")
+                value_latents = input_value_latents.to(device=device, dtype=dtype).clone()
+            else:
+                value_latents = torch.randn(
+                    candidate_batch,
+                    value_num_frames,
+                    value_backbone.value_dim,
+                    device=device,
+                    dtype=dtype,
+                    generator=torch.Generator(device=device).manual_seed((int(seed) + 2_000_003) % (2**63 - 1)),
+                )
 
         # Unified-action checkpoints scatter raw actions into a larger zero-padded
         # space.  The inactive dimensions may be excluded from the training loss,
@@ -1504,10 +1865,82 @@ class BaseWAMArchitecture(ABC, nn.Module):
 
         num_train_ts_v = float(self.video_scheduler.num_train_timesteps)
         num_train_ts_a = float(self.action_scheduler.num_train_timesteps)
+        num_train_ts_q = float(self.value_scheduler.num_train_timesteps) if value_enabled else None
 
         t_loop = time.time()
 
         for i in tqdm(range(len(schedule) - 1), desc="Joint denoising"):
+            if value_enabled:
+                t_v, t_q, t_a = schedule[i]
+                t_v_next, t_q_next, t_a_next = schedule[i + 1]
+
+                sigma_v = t_v / num_train_ts_v
+                sigma_q = t_q / num_train_ts_q
+                sigma_a = t_a / num_train_ts_a
+                sigma_v_next = t_v_next / num_train_ts_v
+                sigma_q_next = t_q_next / num_train_ts_q
+                sigma_a_next = t_a_next / num_train_ts_a
+
+                video_stepping = sigma_v != sigma_v_next
+                value_stepping = sigma_q != sigma_q_next
+                action_stepping = sigma_a != sigma_a_next
+                if not video_stepping and not value_stepping and not action_stepping:
+                    continue
+
+                # All three streams remain in the forward during a plateau:
+                # attention context is preserved while only the corresponding
+                # flow update is gated below.
+                v_timestep = torch.full((candidate_batch,), float(t_v), dtype=dtype, device=device)
+                q_timestep = torch.full((candidate_batch,), float(t_q), dtype=dtype, device=device)
+                a_timestep = torch.full((candidate_batch,), float(t_a), dtype=dtype, device=device)
+                torch.compiler.cudagraph_mark_step_begin()
+                output = self(
+                    action_latents,
+                    a_timestep,
+                    noisy_values=value_latents,
+                    value_timestep=q_timestep,
+                    **inputs_shared,
+                    timestep=v_timestep,
+                )
+                if not isinstance(output, tuple) or len(output) != 3:
+                    raise RuntimeError(
+                        "value-enabled generation requires forward() to return "
+                        "(video_velocity, action_velocity, value_velocity)"
+                    )
+                noise_pred, action_noise_pred, value_noise_pred = output
+
+                if video_stepping:
+                    new_latents = inputs_shared["latents"] + noise_pred * (sigma_v_next - sigma_v)
+                    ref_latents = inputs_shared.get("first_frame_latents")
+                    if ref_latents is not None:
+                        new_latents = new_latents.clone()
+                        new_latents[:, :, : ref_latents.shape[2]] = ref_latents
+                    inputs_shared["latents"] = new_latents
+
+                if value_stepping:
+                    if value_noise_pred is None:
+                        raise RuntimeError("value-enabled generation forward returned no value velocity")
+                    value_latents = self.value_scheduler.flow_step(
+                        value_noise_pred, sigma_q, sigma_q_next, value_latents
+                    )
+
+                if action_stepping and action_noise_pred is not None:
+                    if inactive_action_dims is not None and inactive_action_noise is None:
+                        sigma_a_f = float(sigma_a)
+                        if sigma_a_f <= 0.0:
+                            raise ValueError("Cannot initialize inactive action noise from a non-positive sigma.")
+                        inactive_action_noise = (
+                            action_latents[..., inactive_action_dims].detach().clone() / sigma_a_f
+                        )
+                    action_latents = self.action_scheduler.flow_step(
+                        action_noise_pred, sigma_a, sigma_a_next, action_latents
+                    )
+                    if inactive_action_dims is not None:
+                        action_latents[..., inactive_action_dims] = inactive_action_noise * float(sigma_a_next)
+                continue
+
+            # Keep the established two-stream code path byte-for-byte in
+            # behavior when value modeling is disabled.
             t_v, t_a = schedule[i]
             t_v_next, t_a_next = schedule[i + 1]
 
@@ -1587,21 +2020,136 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 torch.cuda.synchronize()
             logger.info("[WAM_PROFILE] denoising_loop: %.3fs", time.time() - t_loop)
 
+        selected_candidate = 0
+        value_scores = None
+        raw_values = None
+        if value_enabled:
+            if value_latents is None:
+                raise RuntimeError("value-enabled generation did not initialize value latents")
+            # The value flow operates in symlog(global-Z-score(return)) space.
+            # Undo both transforms before exposing scores so selection is in the
+            # same raw discounted-return units as the RoboDojo sidecars.
+            value_zscores = _symexp(value_latents.float())
+            raw_values = self.value_normalizer.unnormalize(value_zscores)
+            if value_selection == "first":
+                value_scores = raw_values[:, 0].mean(dim=-1)
+            elif value_selection == "last":
+                value_scores = raw_values[:, -1].mean(dim=-1)
+            else:  # value_selection == "mean" was validated above.
+                value_scores = raw_values.mean(dim=(1, 2))
+            selected_candidate = int(torch.argmax(value_scores).item())
+
         # VAE decode. Fail-fast when the backbone is wired to an irreversible
         # external encoder — silently returning None would mask a config
         # mismatch (caller asked for pixels but the encoder cannot produce them).
         if decode_video:
             _assert_decode_video_supported(vb)
-            video_frames = vb.decode_video(inputs_shared["latents"], tiled=tiled)
+            # Candidate generation returns the value-selected trajectory, not
+            # an accidental batch of video frames.
+            video_frames = vb.decode_video(
+                inputs_shared["latents"][selected_candidate : selected_candidate + 1], tiled=tiled
+            )
         else:
             video_frames = None
 
-        actions = action_latents.squeeze(0).float().cpu().numpy()
+        actions = action_latents[selected_candidate].float().cpu().numpy()
         normalizer = getattr(self, "normalizer", None)
         if normalizer is not None:
             actions = normalizer.unnormalize(actions)
 
-        return {"video": video_frames, "actions": actions}
+        result = {"video": video_frames, "actions": actions}
+        if value_enabled:
+            result.update(
+                {
+                    "values": raw_values[selected_candidate].float().cpu().numpy(),
+                    "value_score": float(value_scores[selected_candidate].item()),
+                    "candidate_value_scores": value_scores.float().cpu().numpy(),
+                    "selected_candidate": selected_candidate,
+                }
+            )
+        return result
+
+    def _generate_with_exploration(self, config, *, schedule, prompt, vace_video,
+                                   first_frame_image, num_frames, action_num_frames,
+                                   value_num_frames, value_selection, height, width,
+                                   seed, tiled, num_inference_steps, shift, decode_video,
+                                   profile, vace_cache, prompt_embed_cache, proprio,
+                                   cfg_scale, cfg_merge, active_action_mask,
+                                   extra_pipeline_inputs) -> dict:
+        """Fit video/value initial-noise distributions using full joint rollouts."""
+        from openwam.model.value_backbone.exploration import update_distribution
+
+        prepared = self.video_backbone.preprocess_input_for_inference(
+            prompt=prompt, vace_video=vace_video, first_frame_image=first_frame_image,
+            num_frames=num_frames, height=height, width=width, seed=seed,
+            num_inference_steps=num_inference_steps, shift=shift, tiled=tiled,
+            vace_cache=vace_cache, prompt_embed_cache=prompt_embed_cache,
+            cfg_scale=cfg_scale, cfg_merge=cfg_merge,
+        )
+        template = prepared["latents"]
+        if template.shape[0] != 1:
+            raise ValueError("exploration requires one conditioned observation")
+        video_mean = torch.zeros_like(template)
+        video_std = torch.ones_like(template)
+        value_shape = (1, value_num_frames, self.value_backbone.value_dim)
+        value_mean = torch.zeros(value_shape, device=self.device, dtype=self.dtype)
+        value_std = torch.ones_like(value_mean)
+        video_rng = torch.Generator(device=self.device).manual_seed((int(seed) + 1_000_003) % (2**63 - 1))
+        value_rng = torch.Generator(device=self.device).manual_seed((int(seed) + 2_000_003) % (2**63 - 1))
+        shared_kwargs = dict(
+            schedule=schedule, prompt=prompt, vace_video=vace_video,
+            first_frame_image=first_frame_image, num_frames=num_frames,
+            action_num_frames=action_num_frames, value_num_frames=value_num_frames,
+            value_selection=value_selection, height=height, width=width, tiled=tiled,
+            num_inference_steps=num_inference_steps, shift=shift,
+            vace_cache=vace_cache, prompt_embed_cache=prompt_embed_cache,
+            proprio=proprio, cfg_scale=cfg_scale, cfg_merge=cfg_merge,
+            active_action_mask=active_action_mask, _preprocessed_inputs=prepared,
+            **extra_pipeline_inputs,
+        )
+
+        def draw(mean, std, generator):
+            noise = torch.randn(mean.shape, device=mean.device, dtype=mean.dtype, generator=generator)
+            return mean + std * noise
+
+        history = []
+        for round_index in range(config.steps):
+            video_samples, value_samples, scores = [], [], []
+            for candidate_index in range(config.candidates):
+                video_noise = draw(video_mean, video_std, video_rng)
+                value_noise = draw(value_mean, value_std, value_rng)
+                result = self.generate(
+                    **shared_kwargs, seed=int(seed) + round_index * config.candidates + candidate_index,
+                    input_video_latents=video_noise, input_value_latents=value_noise,
+                    decode_video=False, exploration=None,
+                )
+                video_samples.append(video_noise)
+                value_samples.append(value_noise)
+                scores.append(float(result["value_score"]))
+                del result
+            score_tensor = torch.tensor(scores, device=self.device, dtype=torch.float32)
+            video_mean, video_std = update_distribution(
+                torch.cat(video_samples), score_tensor, video_mean[0], video_std[0], config
+            )
+            value_mean, value_std = update_distribution(
+                torch.cat(value_samples), score_tensor, value_mean[0], value_std[0], config
+            )
+            video_mean, video_std = video_mean.unsqueeze(0), video_std.unsqueeze(0)
+            value_mean, value_std = value_mean.unsqueeze(0), value_std.unsqueeze(0)
+            round_record = {"round": round_index + 1, "candidate_scores": scores,
+                            "best_score": max(scores), "mean_score": sum(scores) / len(scores)}
+            history.append(round_record)
+            logger.info("[value-exploration] round %d/%d best=%.4f mean=%.4f",
+                        round_index + 1, config.steps, round_record["best_score"], round_record["mean_score"])
+
+        final = self.generate(
+            **shared_kwargs, seed=int(seed) + config.steps * config.candidates,
+            input_video_latents=draw(video_mean, video_std, video_rng),
+            input_value_latents=draw(value_mean, value_std, value_rng),
+            decode_video=decode_video, exploration=None, profile=profile,
+        )
+        final["exploration_history"] = history
+        return final
 
     # --- §15: Classifier-Free Guidance helpers (inference-time) ---
 

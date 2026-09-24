@@ -6,6 +6,7 @@ defaults:
 training:
   # --- Debug ---
   debug: false                    # Debug mode: max_steps=20, save@10, constant LR
+  report_to: wandb                 # wandb / none; "none" does not require W&B credentials
 
   # --- Optimizer ---
   learning_rate: 1e-4             # Base learning rate for AdamW
@@ -27,6 +28,7 @@ training:
   # --- Per-module LR (null = use base learning_rate) ---
   action_lr: null                 # Override LR for action model parameters
   video_lr: null                  # Override LR for video backbone parameters
+  value_lr: null                  # Override LR for value model parameters
 
   # --- DeepSpeed / precision ---
   mixed_precision: bf16           # bf16 / fp16 / no — training + deploy compute dtype
@@ -42,6 +44,7 @@ training:
   # --- Loss weights ---
   lambda_video: 1.0               # Video flow-matching loss weight
   lambda_action: 1.0              # Action flow-matching loss weight
+  lambda_value: 0.0               # Value flow-matching loss weight (requires model.architecture.value_backbone.enabled)
 
   # --- Flow matching timestep range ---
   max_timestep_boundary: 1.0      # Upper bound (fraction of total timesteps)

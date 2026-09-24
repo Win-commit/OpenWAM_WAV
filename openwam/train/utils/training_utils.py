@@ -86,18 +86,22 @@ def build_cosine_scheduler(optimizer, *, total_opt_steps: int, cfg, num_processe
 
 
 def init_wandb(cfg):
-    """Init a wandb run from cfg.project.wandb. Returns the run or None."""
+    """Init W&B only when training.report_to=wandb; return None for none."""
+    report_to = str(cfg_get(cfg_get(cfg, "training"), "report_to", "wandb")).lower()
+    if report_to == "none":
+        return None
+    if report_to != "wandb":
+        raise ValueError(f"training.report_to must be 'wandb' or 'none', got {report_to!r}")
     wandb_cfg = cfg.project.get("wandb", None)
     if wandb_cfg is None:
-        return None
+        raise ValueError("training.report_to=wandb requires project.wandb.project")
     project = getattr(wandb_cfg, "project", None)
     if not project:
-        return None
+        raise ValueError("training.report_to=wandb requires project.wandb.project")
     try:
         import wandb
-    except ImportError:
-        logger.warning("wandb not installed, skipping wandb logging")
-        return None
+    except ImportError as exc:
+        raise RuntimeError("training.report_to=wandb requires the wandb package") from exc
 
     run_name = getattr(wandb_cfg, "run_name", None)
     entity = getattr(wandb_cfg, "entity", None)
@@ -117,34 +121,44 @@ def init_wandb(cfg):
 def reduce_step_metrics(accelerator, losses: dict, grad_norm) -> dict:
     """Reduce loss/grad_norm across ranks (mean); single-process fast path."""
     loss = losses["total"]
+    has_value = "value" in losses
 
     def _f(v):
         return v.item() if isinstance(v, torch.Tensor) else float(v)
 
     if accelerator is not None and accelerator.num_processes > 1:
+        fields = [
+            loss.detach().float().item(),
+            _f(losses["video"]),
+            _f(losses["action"]),
+        ]
+        if has_value:
+            fields.append(_f(losses["value"]))
+        fields.append(grad_norm.item())
         local = torch.tensor(
-            [
-                loss.detach().float().item(),
-                _f(losses["video"]),
-                _f(losses["action"]),
-                grad_norm.item(),
-            ],
+            fields,
             device=loss.device,
             dtype=torch.float32,
         ).reshape(1, -1)
         g = accelerator.gather(local).mean(dim=0)
-        return {
+        result = {
             "loss_total": g[0].item(),
             "loss_video": g[1].item(),
             "loss_action": g[2].item(),
-            "grad_norm": g[3].item(),
+            "grad_norm": g[-1].item(),
         }
-    return {
+        if has_value:
+            result["loss_value"] = g[3].item()
+        return result
+    result = {
         "loss_total": loss.detach().item(),
         "loss_video": _f(losses["video"]),
         "loss_action": _f(losses["action"]),
         "grad_norm": grad_norm.item(),
     }
+    if has_value:
+        result["loss_value"] = _f(losses["value"])
+    return result
 
 
 def write_debug_loss_row(

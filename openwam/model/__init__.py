@@ -2,6 +2,7 @@
 from openwam.model import architectures  # noqa: F401
 from openwam.model.action_backbone.separate_action_dit import ActionDiT, ActionDiTState
 from openwam.model.action_backbone.shared_action_backbone import SharedMoEActionBackbone
+from openwam.model.value_backbone import ValueBackbone, ValueDiT
 from openwam.model.architectures import (
     ARCHITECTURE_METADATA,
     ARCHITECTURE_REGISTRY,
@@ -19,6 +20,8 @@ from openwam.model.architectures import (
 __all__ = [
     "ActionDiT",
     "ActionDiTState",
+    "ValueBackbone",
+    "ValueDiT",
     "SharedMoEActionBackbone",
     "BaseWAMArchitecture",
     "ActionState",

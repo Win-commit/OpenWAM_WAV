@@ -392,6 +392,70 @@ Wan2.2-TI2V-5B video backbone, and the Mutual attention mask.
    Install and run the LIBERO client according to the
    [LIBERO evaluation guide](benchmarks/libero/README.md).
 
+### RoboDojo Value-Guided Training
+
+The optional three-stream WAV model uses RoboDojo rather than LIBERO. RoboDojo
+episodes do not publish reward or success fields, so first generate an external,
+non-mutating sparse terminal-demo proxy (`[-1, ..., -1, 0]`) and its global
+value-normalization artifact:
+
+~~~bash
+python scripts/prepare_robodojo_value_targets.py \
+  --dataset-dir /data/robodojo \
+  --sidecar-root /data/robodojo_wav_values \
+  --fast-fingerprint
+~~~
+
+`--fast-fingerprint` checks source size, modification time, and episode length
+without hashing every byte of the large HDF5 corpus. Omit it for full-file
+SHA-256 fingerprints. The training reader validates the recorded source
+metadata in either mode.
+
+Then enable the independent ActionDiT-style ValueBackbone and its loss:
+
+~~~bash
+bash scripts/train.sh \
+  dataloader=robodojo \
+  dataloader.dataset_dir=/data/robodojo \
+  dataloader.include_value_targets=true \
+  dataloader.value_sidecar_root=/data/robodojo_wav_values \
+  model=dual_system \
+  model.architecture.variant=joint_self_attn \
+  model.architecture.attention_mask_mode=mutual \
+  model.architecture.value_backbone.enabled=true \
+  training.lambda_value=1.0
+~~~
+
+The value stream is next-state aligned with actions, has its own noise timestep
+and scheduler (`shift_value=5.0` by default), and cannot attend action tokens.
+At deployment, `inference.value_candidates > 1` jointly samples trajectories
+and returns the candidate with the highest predicted raw discounted return.
+Value-enabled deployment currently uses `denoise_mode=sync`.
+
+For WAV-style iterative exploration, enable `inference.exploration.enabled=true`
+instead of increasing `value_candidates`. Each round samples complete joint
+video/action/value trajectories, selects the highest-value elites, and updates
+the initial video and value noise distributions. The final trajectory is sampled
+from the updated distributions. For example:
+
+~~~bash
+python scripts/deploy.py \
+  --ckpt-dir outputs/robodojo_wav_value/2026-09-22_23-15-46 \
+  --ckpt-name checkpoint_step_60000.safetensors \
+  inference.exploration.enabled=true \
+  inference.inference_horizon=1
+~~~
+
+The default exploration budget is three rounds of eight trajectories, with the
+top 25% retained per round. `inference.value_selection` controls whether the
+first, mean, or last raw value token scores each trajectory. Exploration and
+`value_candidates > 1` cannot be combined. This search optimizes model sampling
+at inference time; the RoboDojo value target is a discounted terminal-demo
+proxy, so model score improvements do not imply improved task success.
+
+The RoboDojo target and the ValueBackbone both default to scalar
+`value_dim=1`; larger explicitly configured widths are also supported.
+
 
 ## OpenWAM Usage Guidance
 

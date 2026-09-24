@@ -135,6 +135,51 @@ def build_cross_modal_attention_mask(
     return mask
 
 
+def build_video_value_action_attention_mask(
+    video_backbone,
+    *,
+    s_video: int,
+    s_value: int,
+    s_action: int = 0,
+    video_tokens_per_frame: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the three-stream ``[video, value, action]`` MoT visibility mask.
+
+    The value stream is deliberately prevented from directly attending action
+    keys.  Every other cross-stream direction is visible.  Video's internal
+    temporal mask remains owned by the video backbone; value/action internal
+    blocks are bidirectional.
+    """
+    if s_video <= 0 or s_value <= 0 or s_action < 0:
+        raise ValueError(
+            f"stream lengths must satisfy video>0, value>0, action>=0; got "
+            f"{s_video}, {s_value}, {s_action}"
+        )
+    v0, v1 = 0, s_video
+    q0, q1 = v1, v1 + s_value
+    a0, a1 = q1, q1 + s_action
+    mask = torch.zeros((a1, a1), dtype=torch.bool, device=device)
+    mask[v0:v1, v0:v1] = video_backbone.build_video_to_video_mask(
+        video_seq_len=s_video,
+        video_tokens_per_frame=video_tokens_per_frame,
+        device=device,
+    )
+    mask[q0:q1, q0:q1] = True
+    # Video <-> value is mutual.
+    mask[v0:v1, q0:q1] = True
+    mask[q0:q1, v0:v1] = True
+    if s_action:
+        mask[a0:a1, a0:a1] = True
+        # Video <-> action is mutual in the three-stream mode.
+        mask[v0:v1, a0:a1] = True
+        mask[a0:a1, v0:v1] = True
+        # Action can read value; value must not read action.
+        mask[a0:a1, q0:q1] = True
+        mask[q0:q1, a0:a1] = False
+    return mask
+
+
 def widen_mask_for_prefix_kv(mask, state):
     """Prepend prefix-K/V key columns to a query×key mask.
 
@@ -182,5 +227,6 @@ __all__ = [
     "set_video_attention_mask_mode",
     "fill_cross_modal_va_blocks",
     "build_cross_modal_attention_mask",
+    "build_video_value_action_attention_mask",
     "widen_mask_for_prefix_kv",
 ]

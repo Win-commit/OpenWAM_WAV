@@ -105,7 +105,12 @@ class JointInferenceEngine(BaseInferenceEngine):
         action_backbone=None,
     ):
         super().__init__(cfg, architecture=architecture, action_backbone=action_backbone)
-        normalize_denoise_config(getattr(cfg, "inference", None))
+        denoise_config = normalize_denoise_config(getattr(cfg, "inference", None))
+        if getattr(architecture, "value_backbone", None) is not None and denoise_config.denoise_mode != "sync":
+            raise NotImplementedError(
+                "value-enabled deployment currently supports denoise_mode='sync' only; "
+                "use the three-stream synchronous scheduler"
+            )
 
         self._architecture_generate_accepts_extra_kwargs: Optional[bool] = None
         self._architecture_generate_kwarg_names: Optional[set[str]] = None
@@ -168,6 +173,17 @@ class JointInferenceEngine(BaseInferenceEngine):
             return value is True
         if name == "profile":
             return value is False
+        if name == "value_num_candidates":
+            try:
+                return int(value) == 1
+            except (TypeError, ValueError):
+                return False
+        if name == "value_selection":
+            return value == "first"
+        if name == "value_num_frames":
+            return value is None
+        if name == "exploration":
+            return value is None or not bool(value.get("enabled", False))
         if name == "vace_cache":
             return not bool(value)
         if name == "prompt_embed_cache":
@@ -271,6 +287,14 @@ class JointInferenceEngine(BaseInferenceEngine):
                 - variance_shift_alpha (float, optional): "async" only; lead curve shift
                 - linear_offset (float, optional): "async" only; lag start delay
                 - denoise_steps (int, optional): override num denoising steps
+                - value_candidates (int, optional): joint video/value/action
+                  candidates to sample and rank by predicted value
+                - value_selection (str, optional): first | mean | last value
+                  token used as the candidate score
+                - value_num_frames (int, optional): value-token horizon;
+                  defaults to the generated action horizon
+                - exploration (mapping, optional): iterative value-guided
+                  noise-distribution search; disabled by default
 
         Returns:
             dict with ``video`` (list of PIL images or None) and ``actions`` (numpy array).
@@ -299,6 +323,13 @@ class JointInferenceEngine(BaseInferenceEngine):
             "shift_video",
             getattr(_vb, "shift_video", None) if _vb is not None else None,
         )
+        _qb = getattr(self.architecture, "value_backbone", None)
+        value_enabled = _qb is not None
+        shift_value = None
+        if value_enabled:
+            shift_value = conditions.get("shift_value", getattr(_qb, "shift_value", None))
+            if shift_value is None:
+                shift_value = 5.0
 
         schedule = make_schedule(
             denoise_mode,
@@ -307,6 +338,8 @@ class JointInferenceEngine(BaseInferenceEngine):
             num_steps=denoise_steps,
             shift=shift,
             shift_video=shift_video,
+            value_scheduler=self.architecture.value_scheduler if value_enabled else None,
+            shift_value=shift_value,
             lead=lead_modality,
             alpha=variance_shift_alpha,
             offset=linear_offset,
@@ -331,6 +364,10 @@ class JointInferenceEngine(BaseInferenceEngine):
                 getattr(inf_cfg, "video_num_frames", action_num_frames),
             )
         )
+        value_candidates = int(conditions.get("value_candidates", getattr(inf_cfg, "value_candidates", 1)))
+        value_selection = conditions.get("value_selection", getattr(inf_cfg, "value_selection", "first"))
+        value_num_frames = conditions.get("value_num_frames", getattr(inf_cfg, "value_num_frames", None))
+        exploration = conditions.get("exploration", getattr(inf_cfg, "exploration", None))
 
         generate_kwargs = self._filter_architecture_generate_kwargs(
             {
@@ -340,6 +377,10 @@ class JointInferenceEngine(BaseInferenceEngine):
                 "first_frame_image": conditions.get("first_frame_image", None),
                 "num_frames": video_num_frames,
                 "action_num_frames": action_num_frames,
+                "value_num_frames": value_num_frames,
+                "value_num_candidates": value_candidates,
+                "value_selection": value_selection,
+                "exploration": exploration,
                 "height": conditions.get("height", getattr(inf_cfg, "height", 384)),
                 "width": conditions.get("width", getattr(inf_cfg, "width", 320)),
                 "seed": conditions.get("seed", 42),

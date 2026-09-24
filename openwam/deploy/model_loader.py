@@ -216,6 +216,7 @@ def load_from_checkpoint_dir(
 
     # 6. Attach the action normalizer built from saved normalization_stats.npy + config.
     architecture.attach_normalizer(_build_normalizer(cfg, ckpt_dir))
+    architecture.attach_value_normalizer(_build_value_normalizer(cfg, ckpt_dir, architecture))
 
     # 7. Binary command dims for the final legality projection at WAMPolicy.predict_action.
     # Authoritative source is the CKPT's dataloader config, never the deploy yaml: the training data
@@ -253,6 +254,35 @@ def repr_contract_from_cfg(cfg: DictConfig) -> dict:
     if gripper_convention is not None:
         contract["gripper_convention"] = gripper_convention
     return contract
+
+
+def _build_value_normalizer(cfg: DictConfig, ckpt_dir: str, architecture):
+    """Load the value-sidecar Z-score inverse for value-enabled WAV deploy."""
+    value_backbone = getattr(architecture, "value_backbone", None)
+    if value_backbone is None:
+        return None
+    lambda_value = float(OmegaConf.select(cfg, "training.lambda_value", default=0.0) or 0.0)
+    if lambda_value <= 0.0:
+        logger.info("[value-normalizer] value backbone is present but lambda_value=0; no value deploy artifact required")
+        return None
+    stats_path = os.path.join(ckpt_dir, "value_normalization_stats.json")
+    if not os.path.isfile(stats_path):
+        raise FileNotFoundError(
+            f"Value-enabled checkpoint is missing {stats_path}. The value sidecar's global Z-score "
+            "artifact must be copied during training so deployment can symexp + de-normalize predictions."
+        )
+    from openwam.dataloader.utils.robodojo_value import load_value_stats
+    from openwam.model.value_backbone import ValueNormalizer
+
+    expected_dim = int(getattr(value_backbone, "value_dim", 1))
+    expected_gamma = float(OmegaConf.select(cfg, "dataloader.value_gamma", default=0.99))
+    stats = load_value_stats(
+        stats_path,
+        expected_gamma=expected_gamma,
+        expected_value_dim=expected_dim,
+    )
+    logger.info("[value-normalizer] Active: value_dim=%d stats=%s", expected_dim, stats_path)
+    return ValueNormalizer(mean=stats["mean"], std=stats["std"])
 
 
 def _build_inner_normalizer(cfg: DictConfig, ckpt_dir: str):

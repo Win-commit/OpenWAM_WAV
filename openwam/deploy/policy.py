@@ -38,6 +38,11 @@ class WAMPolicy:
 
         self._execution_config = normalize_execution_config(execution_config)
         self._async = self._execution_config.enabled
+        if self._async and getattr(getattr(engine, "architecture", None), "value_backbone", None) is not None:
+            raise NotImplementedError(
+                "value-enabled deployment currently supports inference_mode='sync' only; "
+                "the async executor has no three-stream candidate-state contract"
+            )
         if self._async:
             self._executor = AsyncInferenceExecutor(
                 engine=engine,

@@ -38,8 +38,10 @@ from openwam.train.utils.checkpointing import (
     save_config,
     save_full_state,
     save_normalization_stats,
+    save_value_normalization_stats,
     save_weights,
     verify_resume_normalization_stats,
+    verify_resume_value_normalization_stats,
 )
 from openwam.train.utils.optimizer_groups import build_trainable_parameters
 from openwam.train.utils.seeding import per_step_seed, seed_process, wire_sampler_seed
@@ -156,6 +158,27 @@ class OpenWAMTrainer:
         # Loss weights from the training config
         self.lambda_video = float(t.lambda_video)
         self.lambda_action = float(t.lambda_action)
+        self.lambda_value = float(getattr(t, "lambda_value", 0.0))
+        if self.lambda_value > 0:
+            value_backbone = getattr(self.architecture, "value_backbone", None)
+            if value_backbone is None:
+                raise ValueError(
+                    "training.lambda_value > 0 requires "
+                    "model.architecture.value_backbone.enabled=true"
+                )
+            if self.dataset is not None:
+                dataset_value_dim = int(getattr(self.dataset, "value_dim", 0) or 0)
+                model_value_dim = int(value_backbone.value_dim)
+                if dataset_value_dim <= 0:
+                    raise ValueError(
+                        "training.lambda_value > 0 requires a dataloader with value targets; "
+                        "for RoboDojo set dataloader.include_value_targets=true"
+                    )
+                if dataset_value_dim != model_value_dim:
+                    raise ValueError(
+                        f"dataset value_dim={dataset_value_dim} does not match "
+                        f"value_backbone.value_dim={model_value_dim}"
+                    )
 
         # Push forward-time training flags onto the architecture so prepare_inputs
         # is self-contained.
@@ -382,6 +405,7 @@ class OpenWAMTrainer:
             self,
             action_lr=float(t.action_lr) if getattr(t, "action_lr", None) else None,
             video_lr=float(t.video_lr) if getattr(t, "video_lr", None) else None,
+            value_lr=float(t.value_lr) if getattr(t, "value_lr", None) else None,
         )
         betas = tuple(getattr(t, "adam_betas", [0.9, 0.95]))
         return torch.optim.AdamW(params, lr=float(t.learning_rate), weight_decay=float(t.weight_decay), betas=betas)
@@ -462,6 +486,7 @@ class OpenWAMTrainer:
             # diverges from the dataset transform (legacy or regenerated stats).
             if self.dataset is not None:
                 verify_resume_normalization_stats(output_path, self.dataset)
+                verify_resume_value_normalization_stats(output_path, self.dataset)
             return output_path, resume_state_dir
 
         if is_main:
@@ -484,6 +509,7 @@ class OpenWAMTrainer:
             save_config(output_path, self.cfg)
             if self.dataset is not None:
                 save_normalization_stats(output_path, self.dataset)
+                save_value_normalization_stats(output_path, self.dataset)
         else:
             output_path = None
         import torch.distributed as dist
@@ -560,17 +586,21 @@ class OpenWAMTrainer:
         inputs = self.architecture.prepare_inputs(batch)
         if self.lambda_action > 0 and inputs.get("actions") is None:
             raise ValueError("lambda_action > 0 but no action in data.")
+        if self.lambda_value > 0 and inputs.get("values") is None:
+            raise ValueError("lambda_value > 0 but no value targets in data.")
 
         result = self.architecture.compute_loss(
             **inputs,
             lambda_video=self.lambda_video,
             lambda_action=self.lambda_action,
+            lambda_value=self.lambda_value,
         )
 
         return {
             "total": result["loss"],
             "video": result.get("loss_video", torch.tensor(0.0)),
             "action": result.get("loss_action", torch.tensor(0.0)),
+            "value": result.get("loss_value", torch.tensor(0.0)),
         }
 
     # (10) Called each step in train()'s loop — progress bar, wandb log, debug loss-history CSV.
@@ -590,7 +620,7 @@ class OpenWAMTrainer:
         output_path,
     ) -> None:
         """Update progress bar, log to wandb, and (debug) write the loss-history CSV row."""
-        labels = [("action", "loss_action")]
+        labels = [("action", "loss_action"), ("value", "loss_value")]
         loss_total = metrics["loss_total"]
         loss_video = metrics["loss_video"]
         grad_norm = metrics["grad_norm"]
@@ -611,6 +641,8 @@ class OpenWAMTrainer:
                 "train/loss_video": loss_video,
                 "train/grad_norm": grad_norm,
                 "train/lr": lr,
+                "train/optimizer_step": opt_step,
+                "train/epoch": epoch,
                 "performance/steps_per_sec": steps_per_sec,
                 "performance/samples_per_sec": steps_per_sec * batch_size * num_procs,
             }

@@ -7,6 +7,7 @@ All tests run on CPU.
 import tempfile
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -628,6 +629,40 @@ def test_save_checkpoint_excludes_vlm_backbone():
         reloaded = _VLMArch()
         reloaded.load_checkpoint(ckpt_path)
         assert torch.equal(reloaded.action_head.weight, arch.action_head.weight)
+
+
+def test_checkpoint_warm_start_allows_only_value_backbone_missing():
+    """Old OpenWAM weights may initialize a new value expert, but no other drift."""
+    from openwam.model.architectures.base import BaseWAMArchitecture
+
+    class _OldArch(BaseWAMArchitecture):
+        def __init__(self):
+            super().__init__(cfg=None)
+            self.action_backbone = nn.Linear(4, 4)
+
+        def forward(self, *args, **kwargs):  # pragma: no cover
+            raise NotImplementedError
+
+    class _NewArch(_OldArch):
+        def __init__(self, include_extra=False):
+            super().__init__()
+            self.value_backbone = nn.Linear(4, 1)
+            if include_extra:
+                self.unrelated_new_module = nn.Linear(4, 4)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt_path = str(Path(tmpdir) / "old.safetensors")
+        _OldArch().save_checkpoint(ckpt_path)
+
+        _NewArch().load_checkpoint(
+            ckpt_path,
+            allowed_missing_prefixes=("value_backbone.",),
+        )
+        with pytest.raises(RuntimeError, match="unrelated_new_module"):
+            _NewArch(include_extra=True).load_checkpoint(
+                ckpt_path,
+                allowed_missing_prefixes=("value_backbone.",),
+            )
 
 
 def test_manage_checkpoints():

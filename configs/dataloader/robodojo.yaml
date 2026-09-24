@@ -41,6 +41,17 @@ target_camera: cam_head
 # override.
 normalize_mode: min-max          # min-max, z-score, quantile, or null
 
+# Optional WAV value labels. RoboDojo HDF5 has no native reward/success field;
+# create the external sparse terminal-demo sidecars first with
+# scripts/prepare_robodojo_value_targets.py. Values are V(s_{t+1})-aligned
+# with action targets and globally Z-scored using the sidecar stats artifact.
+include_value_targets: false
+value_sidecar_root: null
+value_stats_path: null           # null = <value_sidecar_root>/robodojo_value_stats.json
+value_dim: 1                    # scalar proxy; set e.g. 10 to match an explicit multi-channel model interface
+value_gamma: 0.99
+value_normalize: true            # required: global Z-score coordinates for WAV
+
 # ── Video augmentation (optional) ────────────────────────────────────────────
 # Load-time color jitter applied by the reader to each clip with the SAME
 # random factors across all frames (temporal consistency), TRAIN split only.

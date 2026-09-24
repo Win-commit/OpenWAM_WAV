@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from openwam.model.action_backbone.separate_action_dit import ActionDiT
+from openwam.model.value_backbone import ValueDiT
 from openwam.model.architectures.base import ActionState
 from openwam.model.architectures.dual_system.mot_driver import DualSystemMoTDriver
 from openwam.model.architectures.utils.mask_modes import (
@@ -110,6 +111,99 @@ def test_driver_rejects_unknown_mask_mode():
     ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
     with pytest.raises(ValueError, match="attention_mask_mode"):
         DualSystemMoTDriver(vb, ab, attention_mask_mode="causal")
+
+
+def test_three_stream_driver_uses_identical_attention_geometry():
+    """Video, value and action use the same 4x8 SDPA geometry directly."""
+    vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
+    qb = ValueDiT(
+        value_dim=1,
+        dim=32,
+        ffn_dim=64,
+        num_heads=4,
+        num_layers=2,
+        video_dim=32,
+        bridge_layers=(0, 1),
+        attn_head_dim=8,
+        text_dim=32,
+        rope_base_length=8,
+    )
+    assert qb.num_heads == 4
+    assert qb.head_dim == 8
+    assert qb.num_heads == ab.num_heads
+    assert qb.head_dim == ab.head_dim
+    ab.eval()
+    qb.eval()
+    driver = DualSystemMoTDriver(vb, ab, value_backbone=qb, mot_checkpoint_mixed_attn=False)
+
+    vstate, astate = _make_states(vb, ab, B=2, s_video=6, s_action=3)
+    values = torch.randn(2, 4, 1)
+    context, context_mask = _make_action_context(ab, 2)
+    qstate = qb.prepare_value_state(values, torch.randn(2), context=context, context_mask=context_mask)
+    with torch.no_grad():
+        _vstate, qstate, _astate = driver.run_joint_value_loop(vstate, qstate, astate)
+    prediction = qb.extract_value_prediction(qstate)
+    assert prediction.shape == values.shape
+
+
+def test_three_stream_driver_rejects_value_attention_projection_mismatch():
+    vb = _MockVideoBackbone(dim=32, num_layers=2, num_heads=4)
+    ab = _make_action_dit(dim=32, num_heads=4, num_layers=2)
+    qb = ValueDiT(
+        value_dim=1, dim=16, ffn_dim=32, num_heads=4, num_layers=2,
+        video_dim=32, bridge_layers=(0, 1), attn_head_dim=8, text_dim=32,
+    )
+    with pytest.raises(ValueError, match="value dim .* must equal ActionDiT dim"):
+        DualSystemMoTDriver(vb, ab, value_backbone=qb)
+
+
+def test_value_backbone_copies_action_attention_and_value_io():
+    """The value expert copies ActionDiT's attention modules and own shift."""
+    assert ValueDiT.DEFAULT_VALUE_DIM == 1
+    qb = ValueDiT(
+        value_dim=10,
+        dim=16,
+        ffn_dim=32,
+        num_heads=12,
+        num_layers=1,
+        video_dim=32,
+        bridge_layers=(0,),
+        attn_head_dim=64,
+        text_dim=32,
+    )
+    assert qb.value_dim == 10
+    assert qb.num_heads == 12
+    assert qb.head_dim == 64
+    assert qb.rope_base_length == 57
+    assert qb.shift_value == 5.0
+    from openwam.model.action_backbone.separate_action_dit import ActionDiT, SelfAttnActionDiTBlock
+
+    assert not isinstance(qb, ActionDiT)
+    assert isinstance(qb.value_proj_in, torch.nn.Linear)
+    assert all(isinstance(block, SelfAttnActionDiTBlock) for block in qb.blocks)
+    assert qb.value_proj_in.in_features == qb.value_dim
+    assert qb.value_proj_out is qb.value_decoder
+    action_copy_reference = ActionDiT(
+        action_dim=10,
+        dim=16,
+        ffn_dim=32,
+        num_heads=12,
+        num_layers=1,
+        video_dim=32,
+        bridge_layers=(0,),
+        variant="joint_self_attn",
+        attn_head_dim=64,
+        text_dim=32,
+    )
+    for module_name in ("text_embedding", "time_embedding", "time_projection", "blocks"):
+        value_shapes = {key: tensor.shape for key, tensor in getattr(qb, module_name).state_dict().items()}
+        action_shapes = {
+            key: tensor.shape for key, tensor in getattr(action_copy_reference, module_name).state_dict().items()
+        }
+        assert value_shapes == action_shapes, f"{module_name} drifted from ActionDiT"
+    assert qb.value_proj_in.weight.shape == action_copy_reference.action_encoder.weight.shape
+    assert qb.value_proj_out.weight.shape == action_copy_reference.action_decoder.weight.shape
 
 
 # ---------------------------------------------------------------------------

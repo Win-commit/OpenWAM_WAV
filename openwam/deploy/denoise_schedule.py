@@ -1,4 +1,4 @@
-"""Schedule generator composing two backbone-owned schedulers.
+"""Schedule generator composing backbone-owned denoising schedulers.
 
 This module knows nothing about flow-matching math or specific backbone
 formulas. It receives two scheduler references (video and action,
@@ -8,7 +8,8 @@ timestep series via the duck-typed minimum interface:
     scheduler.set_timesteps(num_inference_steps, shift=...)
     scheduler.timesteps    # 1-D tensor / array
 
-``schedule_sync`` returns a list of ``(t_video, t_action)`` pairs
+``schedule_sync`` returns a list of ``(t_video, t_action)`` pairs (or
+``(t_video, t_value, t_action)`` triples when a value scheduler is supplied)
 describing the per-iteration noise levels for the joint denoising loop,
 terminated with a ``(0.0, 0.0)`` sentinel.
 
@@ -32,7 +33,7 @@ from typing import List, Tuple
 
 import torch
 
-Schedule = List[Tuple[float, float]]
+Schedule = List[Tuple[float, ...]]
 VALID_DENOISE_MODES = ("sync", "async")
 
 
@@ -135,8 +136,10 @@ def schedule_sync(
     shift: float = 5.0,
     *,
     shift_video: float = None,
+    value_scheduler=None,
+    shift_value: float = None,
 ) -> Schedule:
-    """Both streams advance in lockstep on their own timestep series.
+    """Streams advance in lockstep on their own timestep series.
 
     ``shift_video`` (when set, typically from ``arch.video_backbone.shift_video``)
     overrides the video scheduler's α-shift independently of the action
@@ -152,6 +155,11 @@ def schedule_sync(
     action_scheduler.set_timesteps(num_steps, shift=shift)
     v_ts = video_scheduler.timesteps.tolist()
     a_ts = action_scheduler.timesteps.tolist()
+    if value_scheduler is not None:
+        sq = shift if shift_value is None else shift_value
+        value_scheduler.set_timesteps(num_steps, shift=sq)
+        q_ts = value_scheduler.timesteps.tolist()
+        return [(v, q, a) for v, q, a in zip(v_ts, q_ts, a_ts)] + [(0.0, 0.0, 0.0)]
     return [(v, a) for v, a in zip(v_ts, a_ts)] + [(0.0, 0.0)]
 
 
@@ -259,6 +267,8 @@ def make_schedule(
     shift: float = 5.0,
     *,
     shift_video: float = None,
+    value_scheduler=None,
+    shift_value: float = None,
     lead: str = "video",
     alpha: float = 1.0,
     offset: float = 0.0,
@@ -300,7 +310,18 @@ def make_schedule(
     )
     if options.denoise_mode == "sync":
         return schedule_sync(
-            video_scheduler, action_scheduler, num_steps=num_steps, shift=shift, shift_video=shift_video
+            video_scheduler,
+            action_scheduler,
+            num_steps=num_steps,
+            shift=shift,
+            shift_video=shift_video,
+            value_scheduler=value_scheduler,
+            shift_value=shift_value,
+        )
+    if value_scheduler is not None:
+        raise NotImplementedError(
+            "value-enabled deployment currently supports denoise_mode='sync' only; "
+            "three independently scheduled streams do not yet have an async trajectory contract"
         )
     return schedule_variance_shift(
         video_scheduler,

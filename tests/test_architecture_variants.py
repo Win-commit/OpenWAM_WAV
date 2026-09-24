@@ -366,6 +366,74 @@ def test_dual_system_self_attn_bridge_interval_1():
     _run_compute_loss(arch)
 
 
+def test_dual_system_self_attn_three_stream_value_loss_runs_end_to_end():
+    """Video/value/action share one SDPA and the same attention geometry."""
+    cfg = {
+        "framework": "dual_system",
+        "variant": "joint_self_attn",
+        "attention_mask_mode": "mutual",
+        "action_dim": ACTION_DIM,
+        "bridge_layers": None,
+        "bridge_interval": 1,
+        "dim": WAN_VIDEO_DIM,
+        "ffn_dim": 2 * WAN_VIDEO_DIM,
+        "num_heads": 4,
+        "attn_head_dim": 16,
+        "value_backbone": {
+            "enabled": True,
+            "value_dim": 1,
+            "dim": WAN_VIDEO_DIM,
+            "ffn_dim": 2 * WAN_VIDEO_DIM,
+            "num_heads": 4,
+            "attn_head_dim": 16,
+            "rope_base_length": 57,
+            "shift_value": 5.0,
+        },
+    }
+    arch = _build_arch("dual_system_self_attn", cfg, num_layers=2)
+    arch.init_training_schedulers(1000)
+
+    inputs = _make_fake_loss_inputs(B=1, action_dim=ACTION_DIM, T_action=T_ACTION, video_dim=WAN_VIDEO_DIM)
+    inputs["context"] = torch.randn(1, 4, arch.action_backbone.text_dim)
+    inputs["context_mask"] = torch.ones(1, 4, dtype=torch.bool)
+    inputs["seq_lens"] = torch.tensor([4])
+    output = arch.compute_loss(
+        **inputs,
+        actions=torch.randn(1, T_ACTION, ACTION_DIM),
+        values=torch.randn(1, T_ACTION, 1),
+        lambda_value=1.0,
+    )
+
+    assert torch.isfinite(output["loss"])
+    assert torch.isfinite(output["loss_value"])
+    assert arch.value_scheduler is not arch.action_scheduler
+    assert arch.value_backbone.num_heads == arch.action_backbone.num_heads
+    assert arch.value_backbone.head_dim == arch.action_backbone.head_dim
+
+
+def test_dual_system_value_attention_rejects_action_geometry_mismatch():
+    """There is no adapter: value attention must literally match ActionDiT."""
+    cfg = {
+        "framework": "dual_system",
+        "variant": "joint_self_attn",
+        "attention_mask_mode": "mutual",
+        "action_dim": ACTION_DIM,
+        "bridge_layers": None,
+        "bridge_interval": 1,
+        "dim": WAN_VIDEO_DIM,
+        "ffn_dim": 2 * WAN_VIDEO_DIM,
+        "num_heads": 4,
+        "attn_head_dim": 16,
+        "value_backbone": {"enabled": True, "value_dim": 1, "num_heads": 2},
+    }
+    with pytest.raises(ValueError, match="value_backbone.num_heads must match ActionDiT"):
+        _build_arch("dual_system_self_attn", cfg, num_layers=2)
+
+    cfg["value_backbone"] = {"enabled": True, "value_dim": 1, "dim": 16}
+    with pytest.raises(ValueError, match="value_backbone.dim must match ActionDiT"):
+        _build_arch("dual_system_self_attn", cfg, num_layers=2)
+
+
 def test_dual_system_self_attn_rejects_interval_gt_1():
     """joint_self_attn rejects bridge_interval>1 — every video layer must have a MoT step."""
     cfg = {

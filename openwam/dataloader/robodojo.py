@@ -26,6 +26,7 @@ import json
 import os
 import time
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,15 @@ from openwam.dataloader.utils.poses import (
     arms_to_eef20,
     env_relative_world_to_robot_base,
 )
+from openwam.dataloader.utils.robodojo_value import (
+    DEFAULT_VALUE_DIM,
+    DEFAULT_VALUE_GAMMA,
+    VALUE_TARGET_KIND,
+    default_value_stats_path,
+    load_value_stats,
+    read_value_sidecar,
+    value_sidecar_path,
+)
 from openwam.dataloader.utils.unify_action import (
     UNIFY_DIM,
     map_to_unify,
@@ -102,6 +112,14 @@ _CANONICAL_UNIFY_DST_INDEX = np.asarray(
     [*range(10), *range(34, 44)],
     dtype=np.int64,
 )
+
+
+@lru_cache(maxsize=512)
+def _cached_value_sidecar_values(path: str) -> np.ndarray:
+    """Worker-local immutable cache for already index-validated sidecars."""
+    values, _metadata = read_value_sidecar(path)
+    values.setflags(write=False)
+    return values
 
 
 def _config_get(config, key: str, default=None):
@@ -689,6 +707,13 @@ class RoboDojoDataset(BaseDataset):
         unify_action_map: Any = None,
         unify_state_map: Any = None,
         color_jitter: Any = None,
+        include_value_targets: bool = False,
+        value_sidecar_root: str | Path | None = None,
+        value_stats_path: str | Path | None = None,
+        value_stats_tasks: Sequence[str] | None = None,
+        value_dim: int = DEFAULT_VALUE_DIM,
+        value_gamma: float = DEFAULT_VALUE_GAMMA,
+        value_normalize: bool = True,
     ):
         super().__init__()
         if action_mode != DEPLOY_ACTION_MODE:
@@ -721,6 +746,29 @@ class RoboDojoDataset(BaseDataset):
         self.num_video_frames = len(self._video_sample_indices)
         self.multiview = bool(multiview)
         self.target_camera = str(target_camera)
+        self.include_value_targets = bool(include_value_targets)
+        self._value_dim = int(value_dim)
+        self.value_gamma = float(value_gamma)
+        self.value_normalize = bool(value_normalize)
+        self.value_sidecar_root: str | None = None
+        self.value_normalization_stats_path: str | None = None
+        self._value_stats: dict[str, np.ndarray] | None = None
+        self._value_sidecar_files: list[str] = []
+        if self.include_value_targets:
+            if self._value_dim <= 0:
+                raise ValueError(f"value_dim must be positive, got {self._value_dim}")
+            if not self.value_normalize:
+                raise ValueError(
+                    "RoboDojo WAV values must use the sidecar's global Z-score normalization; "
+                    "value_normalize=false is not a supported training coordinate system"
+                )
+            if not 0.0 < self.value_gamma <= 1.0:
+                raise ValueError(f"value_gamma must be in (0, 1], got {self.value_gamma}")
+            if value_sidecar_root is None:
+                raise ValueError(
+                    "include_value_targets=true requires value_sidecar_root; "
+                    "run scripts/prepare_robodojo_value_targets.py first"
+                )
 
         # Apply one sampled set of color factors to the assembled clip.  The
         # transform is intentionally train-only so validation/deployment input
@@ -822,6 +870,64 @@ class RoboDojoDataset(BaseDataset):
         self._episode_lengths = [int(all_metadata[index]["length"]) for index in selected_indices]
         self._instructions = [str(all_metadata[index]["instruction"]) for index in selected_indices]
 
+        if self.include_value_targets:
+            sidecar_root = Path(value_sidecar_root).expanduser()
+            if not sidecar_root.is_absolute():
+                sidecar_root = Path(self.dataset_root) / sidecar_root
+            sidecar_root = sidecar_root.resolve()
+            if not sidecar_root.is_dir():
+                raise FileNotFoundError(
+                    f"RoboDojo value_sidecar_root does not exist: {sidecar_root}; "
+                    "run scripts/prepare_robodojo_value_targets.py first"
+                )
+            stats_path = (
+                Path(value_stats_path).expanduser()
+                if value_stats_path is not None
+                else default_value_stats_path(sidecar_root)
+            )
+            if not stats_path.is_absolute():
+                stats_path = sidecar_root / stats_path
+            if not stats_path.is_file():
+                raise FileNotFoundError(
+                    f"RoboDojo value stats do not exist: {stats_path}; "
+                    "run scripts/prepare_robodojo_value_targets.py first"
+                )
+            loaded_value_stats = load_value_stats(
+                stats_path,
+                expected_gamma=self.value_gamma,
+                expected_value_dim=self._value_dim,
+                expected_tasks=value_stats_tasks,
+            )
+            self.value_sidecar_root = str(sidecar_root)
+            self.value_normalization_stats_path = str(stats_path)
+            self._value_stats = {
+                "mean": np.asarray(loaded_value_stats["mean"], dtype=np.float32),
+                "std": np.asarray(loaded_value_stats["std"], dtype=np.float32),
+            }
+            for source_path, source_length in zip(self._episode_files, self._episode_lengths):
+                sidecar_path = value_sidecar_path(
+                    source_path,
+                    dataset_root=self.dataset_root,
+                    sidecar_root=sidecar_root,
+                )
+                if not sidecar_path.is_file():
+                    raise FileNotFoundError(
+                        f"RoboDojo value sidecar missing for {source_path}: {sidecar_path}; "
+                        "run scripts/prepare_robodojo_value_targets.py first"
+                    )
+                # Startup validation is intentionally cheap (source size/mtime);
+                # the offline converter does a full SHA-256 before it reuses a
+                # sidecar.  No source HDF5 is ever modified here.
+                read_value_sidecar(
+                    sidecar_path,
+                    source_path=source_path,
+                    dataset_root=self.dataset_root,
+                    expected_length=source_length,
+                    expected_gamma=self.value_gamma,
+                    expected_value_dim=self._value_dim,
+                )
+                self._value_sidecar_files.append(str(sidecar_path))
+
         self._window_index: list[tuple[int, int]] = []
         for episode_index, episode_length in enumerate(self._episode_lengths):
             for start in range(
@@ -897,10 +1003,21 @@ class RoboDojoDataset(BaseDataset):
         return self._action_dim_value
 
     @property
+    def value_dim(self) -> int:
+        """Scalar target width, or 0 when this action-only reader is used."""
+        return self._value_dim if self.include_value_targets else 0
+
+    @property
     def normalization_stats(self) -> dict[str, np.ndarray] | None:
         if self._mode_stats is None:
             return None
         return {key: np.asarray(value).copy() for key, value in self._mode_stats.items()}
+
+    @property
+    def value_normalization_stats(self) -> dict[str, np.ndarray] | None:
+        if self._value_stats is None:
+            return None
+        return {key: np.asarray(value).copy() for key, value in self._value_stats.items()}
 
     def denormalize_action(self, action) -> np.ndarray:
         """Gather unified output to EEF20, then invert raw-space normalization."""
@@ -944,6 +1061,36 @@ class RoboDojoDataset(BaseDataset):
             self.height,
             self.width,
         )
+
+    def _value_at(self, episode_index: int, start: int, actual_length: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return next-state-aligned normalized values and their validity mask.
+
+        Action targets are states ``[start+1, ...]``.  Value supervision uses
+        that identical next-state alignment, never the conditioned state at
+        ``start``.  Tail padding is zero-filled after normalization and fully
+        masked from loss.
+        """
+        if not self.include_value_targets:
+            raise RuntimeError("_value_at called while include_value_targets=false")
+        values = _cached_value_sidecar_values(self._value_sidecar_files[episode_index])
+        target = np.asarray(values[start + 1 : start + actual_length], dtype=np.float32).copy()
+        expected = actual_length - 1
+        if target.shape != (expected, self._value_dim):
+            raise ValueError(
+                f"value sidecar sequence shape {target.shape} is inconsistent with "
+                f"window start={start}, actual_length={actual_length}"
+            )
+        if self.value_normalize:
+            assert self._value_stats is not None
+            target = (target - self._value_stats["mean"]) / self._value_stats["std"]
+        validity = np.zeros((self.num_action_steps, self._value_dim), dtype=bool)
+        validity[:expected] = True
+        if expected < self.num_action_steps:
+            target = np.concatenate(
+                [target, np.zeros((self.num_action_steps - expected, self._value_dim), dtype=np.float32)],
+                axis=0,
+            )
+        return torch.from_numpy(target), torch.from_numpy(validity)
 
     def _build_sample(self, episode_index: int, start: int) -> dict[str, Any]:
         path = self._episode_files[episode_index]
@@ -1011,7 +1158,7 @@ class RoboDojoDataset(BaseDataset):
             dtype=torch.bool,
         )
 
-        return {
+        sample = {
             "video": sampled_video,
             "vace_video": None,
             "first_frame_image": [sampled_video[0]],
@@ -1032,6 +1179,12 @@ class RoboDojoDataset(BaseDataset):
             "source_frame": self.source_frame,
             "active_arm": "both",
         }
+        if self.include_value_targets:
+            value, value_mask = self._value_at(episode_index, start, actual_length)
+            sample["value"] = value
+            sample["value_mask"] = value_mask
+            sample["value_target_kind"] = VALUE_TARGET_KIND
+        return sample
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         if index < 0:
@@ -1085,6 +1238,12 @@ class MultiTaskRoboDojoDataset(BaseDataset):
             unify_action_map=_config_get(config, "unify_action_map", None),
             unify_state_map=_config_get(config, "unify_state_map", None),
             color_jitter=_config_get(config, "color_jitter", None),
+            include_value_targets=bool(_config_get(config, "include_value_targets", False)),
+            value_sidecar_root=_config_get(config, "value_sidecar_root", None),
+            value_stats_path=_config_get(config, "value_stats_path", None),
+            value_dim=int(_config_get(config, "value_dim", DEFAULT_VALUE_DIM)),
+            value_gamma=float(_config_get(config, "value_gamma", DEFAULT_VALUE_GAMMA)),
+            value_normalize=bool(_config_get(config, "value_normalize", True)),
         )
 
     def __init__(
@@ -1143,6 +1302,18 @@ class MultiTaskRoboDojoDataset(BaseDataset):
             str(Path(normalization_stats_path)) if normalization_stats_path is not None else None
         )
 
+        # A value sidecar's global Z-score must be shared by every task in a
+        # multi-task stream.  Thread the complete discovered corpus through
+        # child readers so a subset-built stats file cannot slip through.
+        if bool(dataset_kwargs.get("include_value_targets", False)):
+            supplied_value_tasks = dataset_kwargs.get("value_stats_tasks")
+            if supplied_value_tasks is not None and sorted(str(task) for task in supplied_value_tasks) != selected_tasks:
+                raise ValueError(
+                    "value_stats_tasks must match the discovered MultiTask RoboDojo corpus; "
+                    f"got {supplied_value_tasks!r}, expected {selected_tasks!r}"
+                )
+            dataset_kwargs["value_stats_tasks"] = selected_tasks
+
         self._sub_datasets: list[RoboDojoDataset] = []
         self._cumulative_lengths: list[int] = []
         cumulative = 0
@@ -1183,6 +1354,10 @@ class MultiTaskRoboDojoDataset(BaseDataset):
         self.source_frame = first.source_frame
         self.contract_id = first.contract_id
         self._normalization_stats_shared = first.normalization_stats
+        self._value_normalization_stats_shared = first.value_normalization_stats
+        self.value_normalization_stats_path = first.value_normalization_stats_path
+        self.value_sidecar_root = first.value_sidecar_root
+        self._value_dim = first.value_dim
         # Keep the resolved active path, which is None when normalization is off.
         self.normalization_stats_path = first.normalization_stats_path
 
@@ -1195,6 +1370,16 @@ class MultiTaskRoboDojoDataset(BaseDataset):
         if self._normalization_stats_shared is None:
             return None
         return {key: np.asarray(value).copy() for key, value in self._normalization_stats_shared.items()}
+
+    @property
+    def value_dim(self) -> int:
+        return self._value_dim
+
+    @property
+    def value_normalization_stats(self) -> dict[str, np.ndarray] | None:
+        if self._value_normalization_stats_shared is None:
+            return None
+        return {key: np.asarray(value).copy() for key, value in self._value_normalization_stats_shared.items()}
 
     def denormalize_action(self, action) -> np.ndarray:
         return self._sub_datasets[0].denormalize_action(action)

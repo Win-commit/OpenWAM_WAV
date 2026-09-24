@@ -12,6 +12,24 @@ server:
 inference:
   denoise_steps: 10
 
+  # Optional value-guided MPC for a checkpoint trained with the three-stream
+  # ValueBackbone.  Candidates are sampled jointly as video/value/action and
+  # the highest raw discounted-return score is returned.  Value deployment is
+  # synchronous-only in this initial implementation.
+  value_candidates: 1
+  value_selection: first       # first | mean | last value token
+  value_num_frames: null       # null = action horizon (num_frames - 1)
+  # WAV-style iterative elite search over the initial video/value noises.
+  # The existing value_candidates ranking mode and exploration are exclusive.
+  exploration:
+    enabled: false
+    steps: 3
+    candidates: 8
+    elite_fraction: 0.25
+    alpha_smooth: 0.9
+    sigma_decay: 0.5
+    min_std: 0.05
+
   denoise_mode: sync          # trajectory: sync | async; separate from inference_mode
   lead_modality: video        # denoise_mode=async: action | video
   variance_shift_alpha: 1.0   # denoise_mode=async: lead curve shift; >= 1

@@ -285,7 +285,14 @@ def build_architecture_from_ckpt_dir(ckpt_dir: str, *, weights_required: bool, o
         # Plain print so the warm-start is visible on the launch terminal even
         # when logger output is drowned out; non-main ranks have print disabled.
         print(f"[{tag}] loading pretrained weights: {weights}", flush=True)
-        architecture.load_checkpoint(weights)
+        # Enabling the value expert while warm-starting from a pre-value
+        # OpenWAM checkpoint is the supported migration path. Keep the load
+        # strict for the entire old topology and allow only the newly-created
+        # value subtree to initialize from scratch.
+        if getattr(architecture, "value_backbone", None) is not None:
+            architecture.load_checkpoint(weights, allowed_missing_prefixes=("value_backbone.",))
+        else:
+            architecture.load_checkpoint(weights)
         print(f"[{tag}] pretrained weights loaded OK", flush=True)
     return resolved_arch, architecture, ckpt_cfg
 

@@ -24,6 +24,7 @@ from openwam.model.architectures.utils.common import compute_video_tokens_per_fr
 from openwam.model.architectures.utils.mask_modes import (
     ACTION_SEES_VIDEO,
     build_cross_modal_attention_mask,
+    build_video_value_action_attention_mask,
     set_video_attention_mask_mode,
     validate_attention_mask_mode,
     widen_mask_for_prefix_kv,
@@ -61,6 +62,7 @@ class DualSystemMoTDriver:
         self,
         vb: "VideoBackbone",
         ab: "ActionDiTBackbone",
+        value_backbone=None,
         *,
         mot_checkpoint_mixed_attn: bool = True,
         attention_mask_mode: str = ACTION_SEES_VIDEO,
@@ -85,6 +87,7 @@ class DualSystemMoTDriver:
 
         self.vb = vb
         self.ab = ab
+        self.value_backbone = value_backbone
         self.num_layers = vb.num_layers
         self.num_heads = vb.num_heads
         self.head_dim = vb.head_dim
@@ -94,6 +97,37 @@ class DualSystemMoTDriver:
         # Allow the architecture / config to override the video v↔v sub-mode.
         # When None we defer to whatever ``vb.video_attention_mask_mode`` reports.
         set_video_attention_mask_mode(vb, video_attention_mask_mode)
+
+        if value_backbone is not None:
+            if value_backbone.num_layers != self.num_layers:
+                raise ValueError(
+                    f"DualSystemMoTDriver: value num_layers ({value_backbone.num_layers}) must equal "
+                    f"video num_layers ({self.num_layers})."
+                )
+            if value_backbone.num_heads != self.num_heads:
+                raise ValueError(
+                    f"DualSystemMoTDriver: value num_heads ({value_backbone.num_heads}) must equal "
+                    f"action/video num_heads ({self.num_heads})."
+                )
+            if value_backbone.head_dim != self.head_dim:
+                raise ValueError(
+                    f"DualSystemMoTDriver: value head_dim ({value_backbone.head_dim}) must equal "
+                    f"action/video head_dim ({self.head_dim})."
+                )
+            if value_backbone.dim != ab.dim:
+                raise ValueError(
+                    f"DualSystemMoTDriver: value dim ({value_backbone.dim}) must equal "
+                    f"ActionDiT dim ({ab.dim}) so Q/K/V/O attention projections match."
+                )
+            for layer_id, (value_block, action_block) in enumerate(zip(value_backbone.blocks, ab.blocks)):
+                for projection in ("q", "k", "v", "o"):
+                    value_shape = getattr(value_block.self_attn, projection).weight.shape
+                    action_shape = getattr(action_block.self_attn, projection).weight.shape
+                    if value_shape != action_shape:
+                        raise ValueError(
+                            f"DualSystemMoTDriver: value layer {layer_id} self_attn.{projection} "
+                            f"shape {tuple(value_shape)} must match ActionDiT {tuple(action_shape)}"
+                        )
 
     # ------------------------------------------------------------------
     # Mixed attention
@@ -358,6 +392,229 @@ class DualSystemMoTDriver:
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             )
         return vstate, astate
+
+    # ------------------------------------------------------------------
+    # Three-stream Video--Value--Action loop
+    # ------------------------------------------------------------------
+
+    def _step_value_joint_impl(
+        self,
+        layer_id,
+        vstate,
+        qstate,
+        astate,
+        attn_mask,
+        *,
+        suppress_inner_attn_ckpt: bool = False,
+    ):
+        """Run one `[video, value, action?]` mixed-attention layer.
+
+        ``qstate`` is a ValueDiT state but uses the same public split-QKV
+        interface as ActionDiT.  Keeping this implementation here (rather
+        than making video own value) preserves separate expert parameters.
+        """
+        if self.value_backbone is None:
+            raise RuntimeError("value joint loop requested without value_backbone")
+        vb, qb, ab = self.vb, self.value_backbone, self.ab
+        q_v, k_v, val_v, post_v = vb.pre_attn_at_layer(layer_id, vstate)
+        q_q, k_q, val_q, post_q = qb.pre_attn_at_layer(layer_id, qstate)
+        q_parts, k_parts, val_parts = [q_v, q_q], [k_v, k_q], [val_v, val_q]
+        lengths = [q_v.shape[1], q_q.shape[1]]
+        post_a = None
+        if astate is not None:
+            q_a, k_a, val_a, post_a = ab.pre_attn_at_layer(layer_id, astate)
+            q_parts.append(q_a)
+            k_parts.append(k_a)
+            val_parts.append(val_a)
+            lengths.append(q_a.shape[1])
+        ref = q_v
+        stream_refs = [("value", q_q)]
+        if astate is not None:
+            stream_refs.append(("action", q_parts[-1]))
+        for name, tensor in stream_refs:
+            if tensor.dtype != ref.dtype or tensor.device != ref.device:
+                raise RuntimeError(
+                    f"DualSystemMoTDriver: {name} Q dtype/device must match video "
+                    f"(video={ref.dtype}/{ref.device}, {name}={tensor.dtype}/{tensor.device})."
+                )
+        q_cat = torch.cat(q_parts, dim=1)
+        k_cat = torch.cat(k_parts, dim=1)
+        val_cat = torch.cat(val_parts, dim=1)
+        if self.mot_checkpoint_mixed_attn and qb.training and not suppress_inner_attn_ckpt:
+            mixed = torch.utils.checkpoint.checkpoint(
+                self._mixed_attention,
+                q_cat,
+                k_cat,
+                val_cat,
+                attn_mask,
+                use_reentrant=False,
+            )
+        else:
+            mixed = self._mixed_attention(q_cat, k_cat, val_cat, attn_mask)
+        split = mixed.split(lengths, dim=1)
+        vstate = vb.post_attn_at_layer(layer_id, vstate, split[0].contiguous(), post_v)
+        qstate = qb.post_attn_at_layer(layer_id, qstate, split[1].contiguous(), post_q)
+        if astate is not None:
+            astate = ab.post_attn_at_layer(layer_id, astate, split[2].contiguous(), post_a)
+        return vstate, qstate, astate
+
+    def _step_value_joint_checkpointed(self, layer_id, vstate, qstate, astate, *, attn_mask, offload):
+        """Checkpoint one three-stream layer without mutating outer states on recompute.
+
+        This is the value-stream analogue of :meth:`_step_checkpointed`.
+        The state wrappers carry mutable hidden-state fields, so the closure
+        works on shallow copies and returns only tensors.  During autograd
+        recomputation those local wrappers are rebuilt, preventing backward
+        from overwriting the layer outputs retained by the outer loop.
+        """
+        outer_qpayload = qstate.payload
+        if outer_qpayload is None or not hasattr(outer_qpayload, "x_action"):
+            raise RuntimeError("value state payload must expose x_action")
+
+        if astate is None:
+
+            def _run(vx: Tensor, qx: Tensor) -> Tuple[Tensor, Tensor]:
+                local_vstate = copy.copy(vstate)
+                local_qstate = copy.copy(qstate)
+                local_qpayload = copy.copy(outer_qpayload)
+                local_vstate.hidden_states = vx
+                local_qpayload.x_action = qx
+                local_qstate.payload = local_qpayload
+                self._step_value_joint_impl(
+                    layer_id,
+                    local_vstate,
+                    local_qstate,
+                    None,
+                    attn_mask,
+                    suppress_inner_attn_ckpt=True,
+                )
+                return local_vstate.hidden_states, local_qpayload.x_action
+
+            if offload:
+                with torch.autograd.graph.save_on_cpu():
+                    new_vx, new_qx = torch.utils.checkpoint.checkpoint(
+                        _run,
+                        vstate.hidden_states,
+                        outer_qpayload.x_action,
+                        use_reentrant=False,
+                    )
+            else:
+                new_vx, new_qx = torch.utils.checkpoint.checkpoint(
+                    _run,
+                    vstate.hidden_states,
+                    outer_qpayload.x_action,
+                    use_reentrant=False,
+                )
+            vstate.hidden_states = new_vx
+            outer_qpayload.x_action = new_qx
+            return vstate, qstate, None
+
+        outer_apayload = astate.payload
+        if outer_apayload is None or not hasattr(outer_apayload, "x_action"):
+            raise RuntimeError("action state payload must expose x_action")
+
+        def _run(vx: Tensor, qx: Tensor, ax: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+            local_vstate = copy.copy(vstate)
+            local_qstate = copy.copy(qstate)
+            local_astate = copy.copy(astate)
+            local_qpayload = copy.copy(outer_qpayload)
+            local_apayload = copy.copy(outer_apayload)
+            local_vstate.hidden_states = vx
+            local_qpayload.x_action = qx
+            local_apayload.x_action = ax
+            local_qstate.payload = local_qpayload
+            local_astate.payload = local_apayload
+            self._step_value_joint_impl(
+                layer_id,
+                local_vstate,
+                local_qstate,
+                local_astate,
+                attn_mask,
+                suppress_inner_attn_ckpt=True,
+            )
+            return local_vstate.hidden_states, local_qpayload.x_action, local_apayload.x_action
+
+        if offload:
+            with torch.autograd.graph.save_on_cpu():
+                new_vx, new_qx, new_ax = torch.utils.checkpoint.checkpoint(
+                    _run,
+                    vstate.hidden_states,
+                    outer_qpayload.x_action,
+                    outer_apayload.x_action,
+                    use_reentrant=False,
+                )
+        else:
+            new_vx, new_qx, new_ax = torch.utils.checkpoint.checkpoint(
+                _run,
+                vstate.hidden_states,
+                outer_qpayload.x_action,
+                outer_apayload.x_action,
+                use_reentrant=False,
+            )
+        vstate.hidden_states = new_vx
+        outer_qpayload.x_action = new_qx
+        outer_apayload.x_action = new_ax
+        return vstate, qstate, astate
+
+    def run_joint_value_loop(
+        self,
+        vstate,
+        qstate,
+        astate=None,
+        *,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ):
+        """Run the value-enabled MoT loop.
+
+        Builds the three-stream mask once and applies the same outer per-layer
+        activation checkpointing contract as the established two-stream loop.
+        """
+        if self.value_backbone is None:
+            raise RuntimeError("run_joint_value_loop requires a value_backbone")
+        s_video = int(vstate.grid_frames) * self._video_tokens_per_frame(vstate)
+        qpayload = getattr(qstate, "payload", None)
+        if qpayload is None or not hasattr(qpayload, "x_action"):
+            raise RuntimeError("value state payload must expose x_action")
+        s_value = qpayload.x_action.shape[1]
+        if astate is None:
+            s_action = 0
+        else:
+            apayload = getattr(astate, "payload", None)
+            if apayload is None or not hasattr(apayload, "x_action"):
+                raise RuntimeError("action state payload must expose x_action")
+            s_action = apayload.x_action.shape[1]
+        attn_mask = build_video_value_action_attention_mask(
+            self.vb,
+            s_video=s_video,
+            s_value=s_value,
+            s_action=s_action,
+            video_tokens_per_frame=self._video_tokens_per_frame(vstate),
+            device=vstate.hidden_states.device,
+        )
+        attn_mask = widen_mask_for_prefix_kv(attn_mask, vstate)
+        use_outer_checkpoint = bool(use_gradient_checkpointing) and (
+            self.ab.training or self.value_backbone.training
+        )
+        for layer_id in range(self.num_layers):
+            if use_outer_checkpoint:
+                vstate, qstate, astate = self._step_value_joint_checkpointed(
+                    layer_id,
+                    vstate,
+                    qstate,
+                    astate,
+                    attn_mask=attn_mask,
+                    offload=use_gradient_checkpointing_offload,
+                )
+            else:
+                vstate, qstate, astate = self._step_value_joint_impl(
+                    layer_id,
+                    vstate,
+                    qstate,
+                    astate,
+                    attn_mask,
+                )
+        return vstate, qstate, astate
 
 
 __all__ = ["DualSystemMoTDriver"]

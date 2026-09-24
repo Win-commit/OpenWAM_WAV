@@ -38,3 +38,20 @@ architecture:
   mot_checkpoint_mixed_attn: true  # joint_self_attn/idm only: grad-checkpoint the mixed attention (VRAM down)
   detach_bridge: false             # joint_cross_attn only
   idm_video_cond_noise_prob: 0.5   # idm only
+
+  # Optional three-stream Video--Value--Action MoT.  The value expert shares
+  # ActionDiT's architecture but owns all of its own parameters/scheduler.
+  # Supported only with variant=joint_self_attn and attention_mask_mode=mutual.
+  value_backbone:
+    enabled: false
+    value_dim: 1               # RoboDojo scalar return and ValueBackbone default
+    # Copy ActionDiT's hidden width, FFN, and complete attention layer.
+    # null inherits the action expert; mismatched overrides fail.
+    dim: null
+    ffn_dim: null
+    # Wan2.2 TI2V-5B resolves to 24 heads x 128 head dim.
+    num_heads: null
+    attn_head_dim: null
+    # The value expert's 1-D RoPE cache/base length.
+    rope_base_length: 57
+    shift_value: 5.0

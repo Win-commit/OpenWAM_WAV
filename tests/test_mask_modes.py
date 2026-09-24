@@ -15,6 +15,7 @@ from openwam.model.architectures.utils.mask_modes import (
     MUTUAL,
     VIDEO_SEES_ACTION,
     build_cross_modal_attention_mask,
+    build_video_value_action_attention_mask,
     validate_attention_mask_mode,
 )
 
@@ -105,3 +106,30 @@ def test_readonly_tail():
     assert mask[:tail, tail:].all()  # video + action -> tail
     assert mask[tail:, tail:].all()  # tail -> tail
     assert not mask[tail:, :tail].any()  # tail -> video/action blocked
+
+
+def test_video_value_action_mask_blocks_only_value_to_action():
+    """The WAV three-stream contract is [video, value, action]."""
+    sv, sq, sa = 6, 4, 3
+    mask = build_video_value_action_attention_mask(
+        _VBFirstFrameCausal(),
+        s_video=sv,
+        s_value=sq,
+        s_action=sa,
+        video_tokens_per_frame=TPF,
+        device=torch.device("cpu"),
+    )
+    q0, q1 = sv, sv + sq
+    a0 = q1
+    assert mask.shape == (sv + sq + sa, sv + sq + sa)
+    # Each non-video stream sees itself.
+    assert mask[q0:q1, q0:q1].all()
+    assert mask[a0:, a0:].all()
+    # Video <-> value and video <-> action are mutual in this mode.
+    assert mask[:sv, q0:q1].all()
+    assert mask[q0:q1, :sv].all()
+    assert mask[:sv, a0:].all()
+    assert mask[a0:, :sv].all()
+    # Action can use value predictions; value is structurally blind to action.
+    assert mask[a0:, q0:q1].all()
+    assert not mask[q0:q1, a0:].any()

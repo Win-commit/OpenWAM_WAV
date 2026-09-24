@@ -106,6 +106,13 @@ def test_import_action_scheduler():
     assert len(s.timesteps) == 20
 
 
+def test_import_value_backbone():
+    from openwam.model.value_backbone import ValueBackbone, ValueScheduler  # noqa: F401
+
+    assert issubclass(ValueBackbone, object)
+    assert ValueScheduler() is not None
+
+
 def test_import_model_config():
     from openwam.model.video_backbone.wan.shared.core.loader import ModelConfig  # noqa: F401
 

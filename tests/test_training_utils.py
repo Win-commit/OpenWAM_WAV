@@ -3,12 +3,16 @@
 Pure compute + IO — no GPU, no real Accelerator.
 """
 
+import sys
 import types
 
+import pytest
 import torch
+from omegaconf import OmegaConf
 
 from openwam.train.utils.training_utils import (
     build_cosine_scheduler,
+    init_wandb,
     reduce_step_metrics,
     write_debug_loss_row,
 )
@@ -111,3 +115,61 @@ def test_write_debug_loss_row_columns_follow_labels(tmp_path):
     )
     header = (tmp_path / "debug_loss_history.csv").read_text().splitlines()[0]
     assert header == ("step,opt_step,epoch,loss,loss_video,loss_custom,grad_norm,lr,steps_per_sec")
+
+
+def test_report_to_none_skips_wandb(monkeypatch):
+    fake_wandb = types.SimpleNamespace(init=lambda **_kwargs: pytest.fail("wandb.init must not run"))
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    cfg = OmegaConf.create({"training": {"report_to": "none"}, "project": {"wandb": {"project": "test"}}})
+    assert init_wandb(cfg) is None
+
+
+def test_report_to_wandb_uses_project_and_random_name(monkeypatch):
+    calls = []
+    fake_run = types.SimpleNamespace(name="wandb-generated-name")
+    fake_wandb = types.SimpleNamespace(init=lambda **kwargs: calls.append(kwargs) or fake_run)
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    cfg = OmegaConf.create({
+        "training": {"report_to": "wandb"},
+        "project": {"wandb": {"project": "openwam-robodojo-value", "run_name": None, "entity": None}},
+    })
+    assert init_wandb(cfg) is fake_run
+    assert calls[0]["project"] == "openwam-robodojo-value"
+    assert calls[0]["name"] is None
+    assert calls[0]["config"]["training"]["report_to"] == "wandb"
+
+
+def test_report_to_rejects_unknown_backend():
+    cfg = OmegaConf.create({"training": {"report_to": "tensorboard"}})
+    with pytest.raises(ValueError, match="training.report_to"):
+        init_wandb(cfg)
+
+
+def test_wandb_step_logs_value_loss_and_training_progress():
+    from openwam.train.openwam_trainer import OpenWAMTrainer
+
+    calls = []
+    run = types.SimpleNamespace(log=lambda payload, step: calls.append((payload, step)))
+    trainer = types.SimpleNamespace(accelerator=types.SimpleNamespace(num_processes=8))
+    OpenWAMTrainer.log_step(
+        trainer,
+        metrics={"loss_total": 1.0, "loss_video": 0.2, "loss_action": 0.3, "loss_value": 0.5, "grad_norm": 1.5},
+        global_step=7,
+        opt_step=7,
+        epoch=2,
+        lr=1e-4,
+        steps_per_sec=2.0,
+        batch_size=4,
+        pbar=None,
+        wandb_run=run,
+        debug=False,
+        output_path="unused",
+    )
+    payload, step = calls[0]
+    assert step == 7
+    assert payload["train/loss_value"] == 0.5
+    assert payload["train/lr"] == 1e-4
+    assert payload["train/grad_norm"] == 1.5
+    assert payload["train/optimizer_step"] == 7
+    assert payload["train/epoch"] == 2
+    assert payload["performance/samples_per_sec"] == 64.0
