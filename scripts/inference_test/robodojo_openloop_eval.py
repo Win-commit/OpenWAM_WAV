@@ -64,7 +64,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", choices=("all", "wav", "base"), default="all")
     parser.add_argument("--explore", action="store_true", help="Use iterative value-guided search for WAV.")
     parser.add_argument("--explore-steps", type=int, default=3)
-    parser.add_argument("--explore-candidates", type=int, default=8)
+    parser.add_argument("--dynamic-groups", type=int, default=8)
+    parser.add_argument("--value-groups", type=int, default=1)
+    parser.add_argument("--candidate-batch-size", type=int, default=8)
+    parser.add_argument("--sigma-decay", type=float, default=0.5)
+    parser.add_argument("--alpha-smooth", type=float, default=0.9)
+    parser.add_argument("--value-elites", type=float, default=0.25)
+    parser.add_argument("--dynamic-elites", type=float, default=0.25)
+    parser.add_argument("--min-std", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -254,12 +261,15 @@ def run_full_episode(
         if args.explore:
             conditions["exploration"] = {
                 "enabled": True,
-                "steps": args.explore_steps,
-                "candidates": args.explore_candidates,
-                "elite_fraction": 0.25,
-                "alpha_smooth": 0.9,
-                "sigma_decay": 0.5,
-                "min_std": 0.05,
+                "explore_steps": args.explore_steps,
+                "dynamic_groups": args.dynamic_groups,
+                "value_groups": args.value_groups,
+                "candidate_batch_size": args.candidate_batch_size,
+                "sigma_decay": args.sigma_decay,
+                "alpha_smooth": args.alpha_smooth,
+                "value_elites": args.value_elites,
+                "dynamic_elites": args.dynamic_elites,
+                "min_std": args.min_std,
             }
         with torch.inference_mode():
             prediction = engine.generate(conditions)

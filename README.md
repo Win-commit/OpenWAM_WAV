@@ -446,8 +446,14 @@ python scripts/deploy.py \
   inference.inference_horizon=1
 ~~~
 
-The default exploration budget is three rounds of eight trajectories, with the
-top 25% retained per round. `inference.value_selection` controls whether the
+The default exploration budget stays at three rounds of eight joint trajectories:
+eight video noise groups and one value noise per group. Candidates are evaluated
+in microbatches of eight; tune `candidate_batch_size` to fit GPU memory.
+`dynamic_elites` keeps the highest scoring video groups (each group's score is
+its best value sample), while `value_elites` keeps the highest scoring value
+samples across all groups. All exploration settings are
+exposed under `inference.exploration` and as flags in
+`scripts/inference_test/robodojo_openloop_eval.py`. `inference.value_selection` controls whether the
 first, mean, or last raw value token scores each trajectory. Exploration and
 `value_candidates > 1` cannot be combined. This search optimizes model sampling
 at inference time; the RoboDojo value target is a discounted terminal-demo

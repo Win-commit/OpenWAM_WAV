@@ -23,9 +23,12 @@ inference:
   # The existing value_candidates ranking mode and exploration are exclusive.
   exploration:
     enabled: false
-    steps: 3
-    candidates: 8
-    elite_fraction: 0.25
+    explore_steps: 3
+    dynamic_groups: 8
+    value_groups: 1
+    candidate_batch_size: 8   # Adjust to available GPU memory
+    value_elites: 0.25
+    dynamic_elites: 0.25
     alpha_smooth: 0.9
     sigma_decay: 0.5
     min_std: 0.05

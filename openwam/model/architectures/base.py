@@ -2113,26 +2113,45 @@ class BaseWAMArchitecture(ABC, nn.Module):
             return mean + std * noise
 
         history = []
-        for round_index in range(config.steps):
-            video_samples, value_samples, scores = [], [], []
-            for candidate_index in range(config.candidates):
-                video_noise = draw(video_mean, video_std, video_rng)
-                value_noise = draw(value_mean, value_std, value_rng)
+        candidates_per_round = config.dynamic_groups * config.value_groups
+        for round_index in range(config.explore_steps):
+            # WAV-style grouped proposals: each dynamic noise is paired with
+            # value_groups independent value noises. The joint model still
+            # denoises every pair, since the streams attend to one another.
+            video_samples = draw(
+                video_mean.expand(config.dynamic_groups, *video_mean.shape[1:]),
+                video_std.expand(config.dynamic_groups, *video_std.shape[1:]), video_rng,
+            )
+            value_samples = draw(
+                value_mean.expand(candidates_per_round, *value_mean.shape[1:]),
+                value_std.expand(candidates_per_round, *value_std.shape[1:]), value_rng,
+            )
+            candidate_videos = video_samples.repeat_interleave(config.value_groups, dim=0)
+            scores = []
+            for batch_start in range(0, candidates_per_round, config.candidate_batch_size):
+                batch_end = min(batch_start + config.candidate_batch_size, candidates_per_round)
+                batch_size = batch_end - batch_start
                 result = self.generate(
-                    **shared_kwargs, seed=int(seed) + round_index * config.candidates + candidate_index,
-                    input_video_latents=video_noise, input_value_latents=value_noise,
+                    **shared_kwargs, seed=int(seed) + round_index * candidates_per_round + batch_start,
+                    value_num_candidates=batch_size,
+                    input_video_latents=candidate_videos[batch_start:batch_end],
+                    input_value_latents=value_samples[batch_start:batch_end],
                     decode_video=False, exploration=None,
                 )
-                video_samples.append(video_noise)
-                value_samples.append(value_noise)
-                scores.append(float(result["value_score"]))
+                batch_scores = result["candidate_value_scores"]
+                if len(batch_scores) != batch_size:
+                    raise RuntimeError("exploration candidate score count does not match batch size")
+                scores.extend(float(score) for score in batch_scores)
                 del result
             score_tensor = torch.tensor(scores, device=self.device, dtype=torch.float32)
+            dynamic_scores = score_tensor.reshape(config.dynamic_groups, config.value_groups).max(dim=1).values
             video_mean, video_std = update_distribution(
-                torch.cat(video_samples), score_tensor, video_mean[0], video_std[0], config
+                video_samples, dynamic_scores, video_mean[0], video_std[0],
+                config, config.dynamic_elites,
             )
             value_mean, value_std = update_distribution(
-                torch.cat(value_samples), score_tensor, value_mean[0], value_std[0], config
+                value_samples, score_tensor, value_mean[0], value_std[0],
+                config, config.value_elites,
             )
             video_mean, video_std = video_mean.unsqueeze(0), video_std.unsqueeze(0)
             value_mean, value_std = value_mean.unsqueeze(0), value_std.unsqueeze(0)
@@ -2140,10 +2159,10 @@ class BaseWAMArchitecture(ABC, nn.Module):
                             "best_score": max(scores), "mean_score": sum(scores) / len(scores)}
             history.append(round_record)
             logger.info("[value-exploration] round %d/%d best=%.4f mean=%.4f",
-                        round_index + 1, config.steps, round_record["best_score"], round_record["mean_score"])
+                        round_index + 1, config.explore_steps, round_record["best_score"], round_record["mean_score"])
 
         final = self.generate(
-            **shared_kwargs, seed=int(seed) + config.steps * config.candidates,
+            **shared_kwargs, seed=int(seed) + config.explore_steps * candidates_per_round,
             input_video_latents=draw(video_mean, video_std, video_rng),
             input_value_latents=draw(value_mean, value_std, value_rng),
             decode_video=decode_video, exploration=None, profile=profile,
