@@ -1614,7 +1614,7 @@ class BaseWAMArchitecture(ABC, nn.Module):
         action_num_frames: Optional[int] = None,
         value_num_frames: Optional[int] = None,
         value_num_candidates: int = 1,
-        value_selection: str = "first",
+        value_selection: str = "mean",
         exploration: Optional[dict] = None,
         height: int = 384,
         width: int = 320,
@@ -1657,8 +1657,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
                 this many video/value/action trajectories and select the one
                 with the highest predicted value. Must be 1 for old two-stream
                 checkpoints.
-            value_selection: Candidate scoring reduction: ``first`` (MPC
-                default), ``mean``, or ``last`` over value tokens.
+            value_selection: Candidate scoring reduction. ``mean`` (default)
+                uses the full raw-return value sequence; ``first`` and ``last``
+                use one raw-return value token.
             exploration: Optional iterative elite-search configuration. Disabled
                 by default; mutually exclusive with multiple final candidates.
             active_action_mask: Optional ``(action_dim,)`` boolean mask for the
@@ -2027,8 +2028,9 @@ class BaseWAMArchitecture(ABC, nn.Module):
             if value_latents is None:
                 raise RuntimeError("value-enabled generation did not initialize value latents")
             # The value flow operates in symlog(global-Z-score(return)) space.
-            # Undo both transforms before exposing scores so selection is in the
-            # same raw discounted-return units as the RoboDojo sidecars.
+            # Rank and expose values in the same raw discounted-return units
+            # as RoboDojo sidecars. A temporal mean remains meaningful when
+            # discounted returns are negative, unlike mean / std.
             value_zscores = _symexp(value_latents.float())
             raw_values = self.value_normalizer.unnormalize(value_zscores)
             if value_selection == "first":

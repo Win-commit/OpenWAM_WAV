@@ -8,6 +8,8 @@
 
 # Hydra outputs
 outputs/
+/pretrained_model/
+/vis/
 *.pkl
 *.safetensors
 *.pth

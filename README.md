@@ -429,7 +429,9 @@ bash scripts/train.sh \
 The value stream is next-state aligned with actions, has its own noise timestep
 and scheduler (`shift_value=5.0` by default), and cannot attend action tokens.
 At deployment, `inference.value_candidates > 1` jointly samples trajectories
-and returns the candidate with the highest predicted raw discounted return.
+and returns the candidate with the highest mean predicted raw discounted
+return over its complete value trajectory. Returned `values` remain on the
+same scale for plotting against ground truth.
 Value-enabled deployment currently uses `denoise_mode=sync`.
 
 For WAV-style iterative exploration, enable `inference.exploration.enabled=true`
@@ -453,8 +455,12 @@ in microbatches of eight; tune `candidate_batch_size` to fit GPU memory.
 its best value sample), while `value_elites` keeps the highest scoring value
 samples across all groups. All exploration settings are
 exposed under `inference.exploration` and as flags in
-`scripts/inference_test/robodojo_openloop_eval.py`. `inference.value_selection` controls whether the
-first, mean, or last raw value token scores each trajectory. Exploration and
+`scripts/inference_test/robodojo_openloop_eval.py`. `inference.value_selection`
+defaults to `mean` over the complete raw-return value sequence. `first` and
+`last` raw-return scores remain selectable. A mean/std SNR is inappropriate
+for the signed RoboDojo return target: a lower mean can win by having a
+larger temporal standard deviation.
+Exploration and
 `value_candidates > 1` cannot be combined. This search optimizes model sampling
 at inference time; the RoboDojo value target is a discounted terminal-demo
 proxy, so model score improvements do not imply improved task success.

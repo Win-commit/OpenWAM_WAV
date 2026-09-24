@@ -179,7 +179,7 @@ class JointInferenceEngine(BaseInferenceEngine):
             except (TypeError, ValueError):
                 return False
         if name == "value_selection":
-            return value == "first"
+            return value == "mean"
         if name == "value_num_frames":
             return value is None
         if name == "exploration":
@@ -289,8 +289,8 @@ class JointInferenceEngine(BaseInferenceEngine):
                 - denoise_steps (int, optional): override num denoising steps
                 - value_candidates (int, optional): joint video/value/action
                   candidates to sample and rank by predicted value
-                - value_selection (str, optional): first | mean | last value
-                  token used as the candidate score
+                - value_selection (str, optional): mean (full raw-return
+                  trajectory) | first | last raw-return token
                 - value_num_frames (int, optional): value-token horizon;
                   defaults to the generated action horizon
                 - exploration (mapping, optional): iterative value-guided
@@ -365,7 +365,7 @@ class JointInferenceEngine(BaseInferenceEngine):
             )
         )
         value_candidates = int(conditions.get("value_candidates", getattr(inf_cfg, "value_candidates", 1)))
-        value_selection = conditions.get("value_selection", getattr(inf_cfg, "value_selection", "first"))
+        value_selection = conditions.get("value_selection", getattr(inf_cfg, "value_selection", "mean"))
         value_num_frames = conditions.get("value_num_frames", getattr(inf_cfg, "value_num_frames", None))
         exploration = conditions.get("exploration", getattr(inf_cfg, "exploration", None))
 

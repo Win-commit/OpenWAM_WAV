@@ -14,10 +14,10 @@ inference:
 
   # Optional value-guided MPC for a checkpoint trained with the three-stream
   # ValueBackbone.  Candidates are sampled jointly as video/value/action and
-  # the highest raw discounted-return score is returned.  Value deployment is
+  # the highest mean raw discounted-return score is returned. Value deployment is
   # synchronous-only in this initial implementation.
   value_candidates: 1
-  value_selection: first       # first | mean | last value token
+  value_selection: mean        # mean (full raw-return trajectory) | first | last
   value_num_frames: null       # null = action horizon (num_frames - 1)
   # WAV-style iterative elite search over the initial video/value noises.
   # The existing value_candidates ranking mode and exploration are exclusive.
@@ -26,7 +26,7 @@ inference:
     explore_steps: 3
     dynamic_groups: 8
     value_groups: 1
-    candidate_batch_size: 8   # Adjust to available GPU memory
+    candidate_batch_size: 8  # Adjust to available GPU memory
     value_elites: 0.25
     dynamic_elites: 0.25
     alpha_smooth: 0.9

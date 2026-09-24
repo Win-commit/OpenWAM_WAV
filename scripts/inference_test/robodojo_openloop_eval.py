@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import logging
 import os
 import shutil
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wav-checkpoint", type=Path, default=WAV_CHECKPOINT)
     parser.add_argument("--base-checkpoint", type=Path, default=BASE_CHECKPOINT)
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "vis")
+    parser.add_argument("--run-name", default=None, help="Unique model directory name under output-root.")
     parser.add_argument("--plot-python", type=Path, default=Path("/zhaohan/miniconda3/envs/robodojo/bin/python"))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
@@ -63,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=25.0, help="Raw episode playback FPS.")
     parser.add_argument("--model", choices=("all", "wav", "base"), default="all")
     parser.add_argument("--explore", action="store_true", help="Use iterative value-guided search for WAV.")
+    parser.add_argument("--value-selection", choices=("first", "mean", "last"), default="mean")
     parser.add_argument("--explore-steps", type=int, default=3)
     parser.add_argument("--dynamic-groups", type=int, default=8)
     parser.add_argument("--value-groups", type=int, default=1)
@@ -208,7 +211,7 @@ def load_engine(checkpoint: Path, args: argparse.Namespace, expect_value: bool):
                 "denoise_mode": "sync",
                 "inference_mode": "sync",
                 "value_candidates": 1,
-                "value_selection": "first",
+                "value_selection": args.value_selection,
                 "value_num_frames": WINDOW_ACTIONS,
             },
             "optimization": {
@@ -232,6 +235,9 @@ def run_full_episode(
     model_name: str,
 ) -> dict:
     engine, architecture = load_engine(checkpoint, args, expect_value)
+    cuda_device = torch.device(args.device)
+    if cuda_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(cuda_device)
     predicted_actions: list[np.ndarray] = []
     predicted_values: list[np.ndarray] = []
     predicted_video: list[Image.Image] = []
@@ -255,7 +261,7 @@ def run_full_episode(
             "denoise_mode": "sync",
             "seed": int(args.seed) + window_index,
             "value_candidates": 1,
-            "value_selection": "first",
+            "value_selection": args.value_selection,
             "value_num_frames": WINDOW_ACTIONS,
         }
         if args.explore:
@@ -318,6 +324,12 @@ def run_full_episode(
         raise ValueError(f"episode video coverage incomplete: {video_timestamps[0]}..{video_timestamps[-1]}")
 
     elapsed = time.perf_counter() - t0
+    if cuda_device.type == "cuda":
+        torch.cuda.synchronize(cuda_device)
+        peak_allocated_gib = torch.cuda.max_memory_allocated(cuda_device) / 2**30
+        peak_reserved_gib = torch.cuda.max_memory_reserved(cuda_device) / 2**30
+    else:
+        peak_allocated_gib = peak_reserved_gib = None
     del engine, architecture
     gc.collect()
     if torch.cuda.is_available():
@@ -330,6 +342,8 @@ def run_full_episode(
         "video_timestamps": video_timestamps,
         "start_indices": np.asarray(start_indices, dtype=np.int64),
         "elapsed_seconds": elapsed,
+        "peak_allocated_gib": peak_allocated_gib,
+        "peak_reserved_gib": peak_reserved_gib,
     }
 
 
@@ -387,20 +401,42 @@ def save_plot(result: dict, sample: dict, args: argparse.Namespace, paths: dict,
         subprocess.run(command, check=True, cwd=PROJECT_ROOT)
 
 
-def report_metrics(model_name: str, result: dict, sample: dict) -> None:
+def report_metrics(model_name: str, result: dict, sample: dict) -> dict:
     action_error = result["actions"].astype(np.float64) - sample["ground_truth_actions"].astype(np.float64)
     action_mae = float(np.mean(np.abs(action_error)))
-    action_rmse = float(np.sqrt(np.mean(np.square(action_error))))
-    message = f"[{model_name}] full episode action MAE={action_mae:.6f} RMSE={action_rmse:.6f}"
+    action_mse = float(np.mean(np.square(action_error)))
+    action_rmse = float(np.sqrt(action_mse))
+    video_squared_error = 0.0
+    video_pixel_count = 0
+    with h5py.File(sample["episode"], "r") as handle:
+        for timestamp, frame in zip(result["video_timestamps"], result["video_frames"]):
+            if timestamp == 0:  # the first image is observed, not predicted
+                continue
+            truth = np.asarray(decode_canvas(handle, timestamp), dtype=np.float32)
+            predicted = np.asarray(frame, dtype=np.float32)
+            difference = predicted - truth
+            video_squared_error += float(np.square(difference, dtype=np.float64).sum())
+            video_pixel_count += difference.size
+    video_mse = video_squared_error / video_pixel_count
+    video_psnr_db = float(10.0 * np.log10(255.0**2 / video_mse))
+    message = (f"[{model_name}] full episode action MSE={action_mse:.6f} "
+               f"MAE={action_mae:.6f} RMSE={action_rmse:.6f}; "
+               f"video PSNR={video_psnr_db:.3f} dB")
+    metrics = {"action_mse": action_mse, "action_mae": action_mae,
+               "action_rmse": action_rmse, "video_psnr_db": video_psnr_db,
+               "video_mse": video_mse, "video_frames_evaluated": len(result["video_timestamps"]) - 1}
     if result["values"] is not None:
         value_error = result["values"].astype(np.float64) - sample["ground_truth_values"].astype(np.float64)
         value_mae = float(np.mean(np.abs(value_error)))
         value_rmse = float(np.sqrt(np.mean(np.square(value_error))))
         message += f"; value MAE={value_mae:.6f} RMSE={value_rmse:.6f}"
+        metrics.update(value_mae=value_mae, value_rmse=value_rmse)
     print(message, flush=True)
+    return metrics
 
 
 def main() -> None:
+    wall_start = time.perf_counter()
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if str(args.device).startswith("cuda") and not torch.cuda.is_available():
@@ -415,6 +451,10 @@ def main() -> None:
     if args.explore:
         model_specs = [(f"{name}_explore", checkpoint, has_value)
                        for name, checkpoint, has_value in model_specs]
+    if args.run_name is not None:
+        if len(model_specs) != 1 or Path(args.run_name).name != args.run_name or args.run_name in {"", ".", ".."}:
+            raise ValueError("--run-name requires one model and a single safe directory name")
+        model_specs = [(args.run_name, model_specs[0][1], model_specs[0][2])]
     checkpoints = [args.wav_checkpoint if args.model != "base" else args.base_checkpoint]
     if args.model == "all":
         checkpoints.append(args.base_checkpoint)
@@ -462,8 +502,19 @@ def main() -> None:
         save_pred_video(result, sample["length"], paths[model_name]["video"] / video_filename_pred, args.fps)
         save_plot(result, sample, args, paths[model_name], model_name=model_name,
                   has_value=has_value and not args.explore)
-        report_metrics(model_name, result, sample)
+        metrics = report_metrics(model_name, result, sample)
         print(f"[{model_name}] generation time {result['elapsed_seconds']:.1f}s", flush=True)
+        print("METRICS_JSON " + json.dumps({
+            "run_name": model_name, "episode": str(sample["episode"]),
+            "episode_length": sample["length"], "windows": len(sample["starts"]),
+            "generation_seconds": result["elapsed_seconds"],
+            "wall_seconds": time.perf_counter() - wall_start,
+            "peak_allocated_gib": result["peak_allocated_gib"],
+            "peak_reserved_gib": result["peak_reserved_gib"],
+            "exploration": {"steps": args.explore_steps, "dynamic_groups": args.dynamic_groups,
+                            "value_groups": args.value_groups, "candidate_batch_size": args.candidate_batch_size},
+            **metrics,
+        }), flush=True)
         del result
         gc.collect()
 
