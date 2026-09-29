@@ -394,6 +394,9 @@ Wan2.2-TI2V-5B video backbone, and the Mutual attention mask.
 
 ### RoboDojo Value-Guided Training
 
+For the end-to-end RoboDojo base/WAV training and evaluation commands, see the
+[RoboDojo WAV guide](ROBODOJO_WAV_GUIDE.md).
+
 The optional three-stream WAV model uses RoboDojo rather than LIBERO. RoboDojo
 episodes do not publish reward or success fields, so first generate an external,
 non-mutating sparse terminal-demo proxy (`[-1, ..., -1, 0]`) and its global
